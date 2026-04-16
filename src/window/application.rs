@@ -5,7 +5,7 @@ use std::{
 
 #[cfg(target_os = "macos")]
 use {
-    crate::bridge::{send_or_queue_file_drop, set_active_route_handler},
+    crate::bridge::{OpenArgs, send_or_queue_file_drop, set_active_route_handler},
     crate::utils::resolve_relative_path,
     std::path::Path,
 };
@@ -22,7 +22,7 @@ use winit::{
 
 use super::{
     CmdLineSettings, EventPayload, EventTarget, RouteId, WindowSettings, WindowSize,
-    WinitWindowWrapper, save_window_size,
+    WinitWindowWrapper, error_window, save_window_size,
 };
 use crate::{
     clipboard::{Clipboard, ClipboardHandle},
@@ -124,6 +124,7 @@ pub struct Application {
     #[allow(dead_code)]
     initial_grid_size: Option<Size2<Grid<u32>>>,
     render_states: FxHashMap<WindowId, RenderState>,
+    error_windows: FxHashMap<WindowId, (error_window::State, String)>,
 
     pub window_wrapper: WinitWindowWrapper,
     create_window_allowed: bool,
@@ -161,6 +162,7 @@ impl Application {
             idle,
             initial_grid_size,
             render_states: FxHashMap::default(),
+            error_windows: FxHashMap::default(),
 
             window_wrapper,
             create_window_allowed: false,
@@ -260,14 +262,30 @@ impl Application {
         event_loop: &ActiveEventLoop,
         new_window: bool,
         cwd: Option<&Path>,
+        args: OpenArgs,
     ) {
-        if new_window {
-            self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd);
-            self.mark_should_render_all();
+        if !new_window {
+            self.activate_focused_route();
+            self.send_file_drops(args);
             return;
         }
 
-        self.activate_focused_route();
+        if self.settings.get::<CmdLineSettings>().server.is_some() {
+            self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd, None);
+            self.mark_should_render_all();
+            self.send_file_drops(args);
+            return;
+        }
+
+        self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd, Some(args));
+        self.mark_should_render_all();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn send_file_drops(&self, args: OpenArgs) {
+        for path in args.files_to_open {
+            send_or_queue_file_drop(path, Some(args.tabs));
+        }
     }
 
     fn handle_app_config_changed(&mut self, config: AppHotReloadConfigs) {
@@ -346,13 +364,12 @@ impl Application {
         }
     }
 
-    fn get_event_deadline(&self) -> Instant {
-        let now = Instant::now();
-        self.render_states
-            .values()
-            .map(|state| self.get_event_deadline_for(state))
-            .min()
-            .unwrap_or(now)
+    fn get_event_deadline(&self) -> Option<Instant> {
+        self.render_states.values().map(|state| self.get_event_deadline_for(state)).min()
+    }
+
+    fn next_control_flow(&self, now: Instant) -> ControlFlow {
+        next_control_flow_for(self.get_event_deadline(), !self.error_windows.is_empty(), now)
     }
 
     fn schedule_next_event(&mut self, event_loop: &ActiveEventLoop) {
@@ -360,9 +377,33 @@ impl Application {
         #[cfg(feature = "profiling")]
         self.aggregate_should_render().plot_tracy();
         if self.create_window_allowed && self.window_wrapper.has_pending_window_creation() {
-            self.window_wrapper.try_create_window(event_loop, &self.proxy, None);
+            self.window_wrapper.try_create_window(event_loop, &self.proxy, None, None);
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.get_event_deadline()));
+        event_loop.set_control_flow(self.next_control_flow(Instant::now()));
+    }
+
+    fn handle_error_window_event(
+        &mut self,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) -> Option<WindowEvent> {
+        let Some((mut error_state, message)) = self.error_windows.remove(&window_id) else {
+            return Some(event);
+        };
+
+        error_state.handle_window_event(event, &message);
+
+        if !error_state.should_close {
+            self.error_windows.insert(window_id, (error_state, message));
+        }
+
+        None
+    }
+
+    fn exit_if_no_windows_remain(&self, event_loop: &ActiveEventLoop) {
+        if self.window_wrapper.is_empty() && self.error_windows.is_empty() {
+            event_loop.exit();
+        }
     }
 
     fn teardown(&mut self) {
@@ -631,6 +672,12 @@ impl ApplicationHandler<EventPayload> for Application {
         event: winit::event::WindowEvent,
     ) {
         tracy_zone!("window_event");
+
+        let Some(event) = self.handle_error_window_event(window_id, event) else {
+            self.exit_if_no_windows_remain(event_loop);
+            return;
+        };
+
         self.ensure_render_state(window_id);
         match event {
             WindowEvent::RedrawRequested => {
@@ -668,15 +715,28 @@ impl ApplicationHandler<EventPayload> for Application {
         match payload {
             UserEvent::ConfigsChanged(config) => self.handle_config_changed(target, *config),
             #[cfg(target_os = "macos")]
-            UserEvent::OpenFiles { files, cwd, caller_cwd, tabs, new_window } => {
+            UserEvent::OpenFiles {
+                files,
+                cwd,
+                caller_cwd,
+                tabs,
+                new_window,
+                neovim_bin,
+                neovim_args,
+            } => {
                 let cwd = cwd.as_deref().map(Path::new);
                 let caller_cwd = caller_cwd.as_deref().map(Path::new);
-                self.prepare_open_files(event_loop, new_window, cwd);
+                let open_args = OpenArgs {
+                    files_to_open: files
+                        .into_iter()
+                        .map(|path| resolve_relative_path(&path, caller_cwd))
+                        .collect(),
+                    tabs,
+                    neovim_bin,
+                    neovim_args,
+                };
 
-                for path in files {
-                    let path = resolve_relative_path(&path, caller_cwd);
-                    send_or_queue_file_drop(path, Some(tabs));
-                }
+                self.prepare_open_files(event_loop, new_window, cwd, open_args);
             }
             UserEvent::NeovimExited => {
                 let route_id = self.route_id_for_target(target);
@@ -693,9 +753,7 @@ impl ApplicationHandler<EventPayload> for Application {
                 if let Some(window_id) = window_id {
                     self.render_states.remove(&window_id);
                 }
-                if self.window_wrapper.is_empty() {
-                    event_loop.exit();
-                }
+                self.exit_if_no_windows_remain(event_loop);
             }
             UserEvent::RedrawRequested => match target {
                 EventTarget::Window(window_id) => {
@@ -767,7 +825,17 @@ impl ApplicationHandler<EventPayload> for Application {
             }
             #[cfg(target_os = "macos")]
             UserEvent::CreateWindow => {
-                self.window_wrapper.try_create_window(event_loop, &self.proxy, None);
+                let (cwd, args) = self
+                    .window_wrapper
+                    .focused_route_launch_context()
+                    .map(|(cwd, args)| (cwd, Some(args)))
+                    .unwrap_or((None, None));
+                self.window_wrapper.try_create_window(
+                    event_loop,
+                    &self.proxy,
+                    cwd.as_deref(),
+                    args,
+                );
                 self.sync_render_states();
                 self.mark_should_render_all();
             }
@@ -775,6 +843,18 @@ impl ApplicationHandler<EventPayload> for Application {
             UserEvent::MacShortcut(command) => {
                 self.window_wrapper.handle_mac_shortcut(command);
                 self.mark_should_render_all();
+            }
+            UserEvent::NeovimLaunchError { message } => {
+                let window_config = error_window::create_error_window(event_loop, &self.settings);
+                let clipboard_handle = ClipboardHandle::new(self.clipboard.as_ref().unwrap());
+                let state = error_window::State::new(
+                    &message,
+                    window_config,
+                    self.settings.clone(),
+                    clipboard_handle,
+                );
+                let window_id = state.window_id();
+                self.error_windows.insert(window_id, (state, message));
             }
             UserEvent::NeovimRestart(details) => {
                 let route_id = self.route_id_for_target(target);
@@ -821,6 +901,7 @@ impl ApplicationHandler<EventPayload> for Application {
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         tracy_zone!("exiting");
         self.teardown();
+        self.error_windows.clear();
         self.window_wrapper.exit();
         self.schedule_next_event(event_loop);
     }
@@ -829,5 +910,17 @@ impl ApplicationHandler<EventPayload> for Application {
 impl Drop for Application {
     fn drop(&mut self) {
         self.teardown();
+    }
+}
+
+fn next_control_flow_for(
+    deadline: Option<Instant>,
+    has_error_windows: bool,
+    now: Instant,
+) -> ControlFlow {
+    match deadline {
+        Some(deadline) => ControlFlow::WaitUntil(deadline),
+        None if has_error_windows => ControlFlow::Wait,
+        None => ControlFlow::WaitUntil(now),
     }
 }

@@ -41,8 +41,8 @@ use {
 use crate::{
     CmdLineSettings,
     bridge::{
-        NeovimHandler, NeovimRuntime, ParallelCommand, RestartDetails, SerialCommand, send_ui,
-        set_active_route_handler, unregister_route_handler,
+        NeovimHandler, NeovimRuntime, OpenArgs, OpenMode, ParallelCommand, RestartDetails,
+        SerialCommand, send_ui, set_active_route_handler, unregister_route_handler,
     },
     clipboard::ClipboardHandle,
     cmd_line::{GeometryArgs, MouseCursorIcon},
@@ -102,6 +102,27 @@ enum GeometryTarget {
     None,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct RouteLaunchConfig {
+    neovim_bin: Option<String>,
+    neovim_args: Option<Vec<String>>,
+}
+
+#[cfg(target_os = "macos")]
+impl RouteLaunchConfig {
+    fn from_open_args(args: &OpenArgs) -> Self {
+        Self { neovim_bin: args.neovim_bin.clone(), neovim_args: args.neovim_args.clone() }
+    }
+
+    fn from_cmdline(cmdline: CmdLineSettings) -> Self {
+        Self {
+            neovim_bin: cmdline.neovim_bin,
+            neovim_args: (!cmdline.neovim_args.is_empty()).then_some(cmdline.neovim_args),
+        }
+    }
+}
+
 pub struct RouteWindow {
     pub skia_renderer: Rc<RefCell<Box<dyn SkiaRenderer>>>,
     pub winit_window: Rc<Window>,
@@ -131,6 +152,10 @@ pub struct Route {
     cwd: Option<PathBuf>,
     pub pending_initial_window_size: Option<WindowSize>,
     state: RouteState,
+    #[cfg(target_os = "macos")]
+    pub neovim_bin: Option<String>,
+    #[cfg(target_os = "macos")]
+    pub neovim_args: Option<Vec<String>>,
 }
 
 impl fmt::Debug for Route {
@@ -205,6 +230,7 @@ pub struct WinitWindowWrapper {
 
     settings: Arc<Settings>,
     clipboard: ClipboardHandle,
+    startup_error: Option<String>,
 
     #[cfg(target_os = "macos")]
     window_mru: VecDeque<WindowId>,
@@ -223,20 +249,27 @@ impl WinitWindowWrapper {
         runtime_tracker: RunningTracker,
         clipboard_handle: ClipboardHandle,
     ) -> Self {
-        let runtime =
-            NeovimRuntime::new(clipboard_handle.clone()).expect("Failed to create neovim runtime");
+        let (runtime, startup_error) = match NeovimRuntime::new(clipboard_handle.clone()) {
+            Ok(rt) => (Some(rt), None),
+            Err(e) => {
+                let msg = format!("Failed to create neovim runtime: {e:?}");
+                log::error!("{msg}");
+                (None, Some(msg))
+            }
+        };
 
         Self {
             routes: Default::default(),
             route_cores: FxHashMap::default(),
             pending_window_creation_route: None,
-            runtime: Some(runtime),
+            runtime,
             runtime_tracker,
             pending_restart: FxHashMap::default(),
             keyboard_manager: KeyboardManager::new(settings.clone()),
             ui_state: UIState::Initing,
             settings: settings.clone(),
             clipboard: clipboard_handle,
+            startup_error,
             #[cfg(target_os = "macos")]
             window_mru: VecDeque::new(),
             #[cfg(target_os = "macos")]
@@ -248,8 +281,18 @@ impl WinitWindowWrapper {
         }
     }
 
+    fn report_startup_error(&self, proxy: &EventLoopProxy<EventPayload>, message: String) {
+        self.runtime_tracker.quit_with_code(1, &message);
+        let _ = proxy.send_event(EventPayload::all(UserEvent::NeovimLaunchError { message }));
+    }
+
     pub fn request_window_creation(&mut self, proxy: &EventLoopProxy<EventPayload>) {
         if !self.routes.is_empty() || !self.route_cores.is_empty() {
+            return;
+        }
+
+        if let Some(error) = self.startup_error.take() {
+            self.report_startup_error(proxy, error);
             return;
         }
 
@@ -273,17 +316,24 @@ impl WinitWindowWrapper {
         let route_id = RouteId::next();
         let runtime = self.runtime.as_mut().expect("Neovim runtime has not been initialized");
 
-        let neovim_handler = runtime
-            .launch(
-                route_id,
-                proxy.clone(),
-                desired_grid_size,
-                self.runtime_tracker.clone(),
-                self.settings.clone(),
-                &config,
-                None,
-            )
-            .expect("Failed to launch neovim runtime");
+        let neovim_handler = match runtime.launch(
+            route_id,
+            proxy.clone(),
+            desired_grid_size,
+            self.runtime_tracker.clone(),
+            self.settings.clone(),
+            &config,
+            None,
+            OpenMode::Startup,
+        ) {
+            Ok(handler) => handler,
+            Err(err) => {
+                let msg = format!("Failed to launch neovim runtime: {err:?}");
+                log::error!("{msg}");
+                self.report_startup_error(proxy, msg);
+                return;
+            }
+        };
 
         self.route_cores.insert(
             route_id,
@@ -301,6 +351,23 @@ impl WinitWindowWrapper {
                 font_changed_last_frame: false,
             },
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn route_launch_config_for_window_creation(
+        &self,
+        args: Option<&OpenArgs>,
+        creating_initial_window: bool,
+    ) -> RouteLaunchConfig {
+        if let Some(args) = args {
+            return RouteLaunchConfig::from_open_args(args);
+        }
+
+        if !creating_initial_window {
+            return RouteLaunchConfig::default();
+        }
+
+        RouteLaunchConfig::from_cmdline(self.settings.get::<CmdLineSettings>())
     }
 
     pub fn has_pending_window_creation(&self) -> bool {
@@ -592,12 +659,7 @@ impl WinitWindowWrapper {
                 for window_id in window_ids.iter() {
                     if let Some(route) = self.routes.get_mut(window_id) {
                         let mut renderer = route.window.renderer.borrow_mut();
-                        let scale_factor = renderer.os_scale_factor;
-                        let renderer_user_scale_factor = renderer.user_scale_factor;
-                        renderer.user_scale_factor = user_scale_factor.into();
-                        renderer
-                            .grid_renderer
-                            .handle_scale_factor_update(scale_factor * renderer_user_scale_factor);
+                        renderer.handle_user_scale_factor_change(user_scale_factor.into());
                         route.state.font_changed_last_frame = true;
                     }
                 }
@@ -1390,6 +1452,7 @@ impl WinitWindowWrapper {
         event_loop: &ActiveEventLoop,
         proxy: &EventLoopProxy<EventPayload>,
         cwd: Option<&Path>,
+        args: Option<OpenArgs>,
     ) {
         let creating_initial_window = self.routes.is_empty();
         let route_id = if creating_initial_window {
@@ -1469,6 +1532,13 @@ impl WinitWindowWrapper {
             ..
         } = self.settings.get::<WindowSettings>();
 
+        // Capture per-route launch config before args is consumed into OpenMode.
+        // For the initial window (args is None, uses OpenMode::Startup), pull from
+        // CmdLineSettings so "New Window" can clone the initial invocation's config.
+        #[cfg(target_os = "macos")]
+        let route_launch_config =
+            self.route_launch_config_for_window_creation(args.as_ref(), creating_initial_window);
+
         let (renderer, neovim_handler, route_pending_initial_window_size, route_cwd) =
             if creating_initial_window {
                 let Some(route_core) = self.route_cores.remove(&route_id) else {
@@ -1498,17 +1568,26 @@ impl WinitWindowWrapper {
 
                 let runtime =
                     self.runtime.as_mut().expect("Neovim runtime has not been initialized");
-                let neovim_handler = runtime
-                    .launch(
-                        route_id,
-                        proxy.clone(),
-                        desired_grid_size,
-                        self.runtime_tracker.clone(),
-                        self.settings.clone(),
-                        &config,
-                        cwd,
-                    )
-                    .expect("Failed to launch neovim runtime");
+                let neovim_handler = match runtime.launch(
+                    route_id,
+                    proxy.clone(),
+                    desired_grid_size,
+                    self.runtime_tracker.clone(),
+                    self.settings.clone(),
+                    &config,
+                    cwd,
+                    args.map_or(OpenMode::None, OpenMode::Args),
+                ) {
+                    Ok(handler) => handler,
+                    Err(err) => {
+                        let msg = format!("Failed to launch neovim runtime: {err:?}");
+                        log::error!("{msg}");
+                        let _ = proxy.send_event(EventPayload::all(UserEvent::NeovimLaunchError {
+                            message: msg,
+                        }));
+                        return;
+                    }
+                };
 
                 (renderer, neovim_handler, None, cwd.map(Path::to_path_buf))
             };
@@ -1518,6 +1597,7 @@ impl WinitWindowWrapper {
         let scale_factor = window.scale_factor();
         {
             let mut renderer_ref = renderer.borrow_mut();
+            renderer_ref.sync_scale_factor();
             renderer_ref.handle_os_scale_factor_change(scale_factor);
         }
 
@@ -1693,6 +1773,10 @@ impl WinitWindowWrapper {
             cwd: route_cwd,
             pending_initial_window_size,
             state,
+            #[cfg(target_os = "macos")]
+            neovim_bin: route_launch_config.neovim_bin,
+            #[cfg(target_os = "macos")]
+            neovim_args: route_launch_config.neovim_args,
         };
         self.routes.insert(window.id(), route);
         self.apply_theme_for_window(window.id());
@@ -2190,6 +2274,21 @@ impl WinitWindowWrapper {
     }
 
     #[cfg(target_os = "macos")]
+    pub fn focused_route_launch_context(&self) -> Option<(Option<PathBuf>, OpenArgs)> {
+        let focused_id = self.get_focused_route()?;
+        let route = self.routes.get(&focused_id)?;
+        Some((
+            route.cwd.clone(),
+            OpenArgs {
+                files_to_open: vec![],
+                tabs: false,
+                neovim_bin: route.neovim_bin.clone(),
+                neovim_args: route.neovim_args.clone(),
+            },
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn activate_and_focus_window(&self, window_id: WindowId) -> bool {
         let Some(feature) = self.macos_feature_for_window(window_id) else {
             return false;
@@ -2417,6 +2516,19 @@ impl WinitWindowWrapper {
         if let Some(route) = self.routes.get(&window_id) {
             let mut skia_renderer = route.window.skia_renderer.borrow_mut();
             skia_renderer.resize();
+        }
+
+        // Read back the actual window size after the resize request. The OS may
+        // constrain the window (e.g. to screen bounds), so the actual size can differ
+        // from what was requested. When that happens, correct Neovim's grid size to
+        // match the real window dimensions.
+        let actual_size = window.inner_size();
+        if actual_size != new_size {
+            if let Some(route) = self.routes.get_mut(&window_id) {
+                route.state.saved_inner_size = actual_size;
+                route.window.last_synced_grid_size = None;
+            }
+            self.update_grid_size_from_window(window_id);
         }
     }
 
