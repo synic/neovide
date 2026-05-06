@@ -20,7 +20,7 @@ use winit::event_loop::EventLoopProxy;
 use winit::window::Theme;
 
 use crate::{
-    bridge::{GridLineCell, GuiOption, NeovimHandler, RedrawEvent, WindowAnchor},
+    bridge::{EditorMode, GridLineCell, GuiOption, NeovimHandler, RedrawEvent, WindowAnchor},
     clipboard::ClipboardHandle,
     profiling::{tracy_named_frame, tracy_zone},
     renderer::{DrawCommand, WindowDrawCommand, rendered_window::BASE_GRID_ID},
@@ -36,8 +36,6 @@ pub use style::{Colors, Style, UnderlineStyle};
 pub use window::*;
 
 use intro::{IntroMessageExtender, IntroProcessing};
-
-const MODE_CMDLINE: u64 = 4;
 pub const MSG_ZINDEX: u64 = 200; // See the documenation for nvim_open_win
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +114,7 @@ pub struct Editor {
     pub mode_list: Vec<CursorMode>,
     pub draw_command_batcher: DrawCommandBatcher,
     pub current_mode_index: Option<u64>,
+    current_mode: EditorMode,
     pub ui_ready: bool,
     event_loop_proxy: EventLoopProxy<EventPayload>,
     route_id: RouteId,
@@ -158,6 +157,7 @@ impl Editor {
             mode_list: Vec::new(),
             draw_command_batcher: DrawCommandBatcher::new(),
             current_mode_index: None,
+            current_mode: EditorMode::Normal,
             ui_ready: false,
             settings,
             event_loop_proxy,
@@ -184,10 +184,10 @@ impl Editor {
             RedrawEvent::ModeInfoSet { cursor_modes } => {
                 tracy_zone!("EditorModeInfoSet");
                 self.mode_list = cursor_modes;
-                if let Some(current_mode_i) = self.current_mode_index {
-                    if let Some(current_mode) = self.mode_list.get(current_mode_i as usize) {
-                        self.cursor.change_mode(current_mode, &self.defined_styles)
-                    }
+                if let Some(current_mode_i) = self.current_mode_index
+                    && let Some(current_mode) = self.mode_list.get(current_mode_i as usize)
+                {
+                    self.cursor.change_mode(current_mode, &self.defined_styles)
                 }
             }
             RedrawEvent::OptionSet { gui_option } => {
@@ -202,6 +202,7 @@ impl Editor {
                 } else {
                     self.current_mode_index = None
                 }
+                self.current_mode = mode.clone();
                 self.draw_command_batcher.queue(DrawCommand::ModeChanged(mode));
             }
             RedrawEvent::MouseOn => {
@@ -264,13 +265,7 @@ impl Editor {
             }
             RedrawEvent::HighlightGroupSet { name, id } => {
                 tracy_zone!("EditorHighlightGroupSet");
-                #[cfg(target_os = "macos")]
-                if name.starts_with("MatchParen") {
-                    self.register_match_paren_highlight_id(id);
-                }
-
-                #[cfg(not(target_os = "macos"))]
-                let _ = (name, id);
+                self.handle_highlight_group_set(name.as_str(), id);
             }
             RedrawEvent::CursorGoto { grid, column: left, row: top } => {
                 tracy_zone!("EditorCursorGoto");
@@ -641,37 +636,36 @@ impl Editor {
 
     fn set_cursor_position(&mut self, grid: u64, grid_left: u64, grid_top: u64) {
         let mut window = self.windows.get_mut(&grid);
-        if let Some(window) = &mut window {
-            if let Some(anchor) = window.anchor_info.as_mut() {
-                // Neovim moves a window to the top of the layer each time the cursor enters it, so do the same here as well
-                self.composition_order += 1;
-                anchor.sort_order.composition_order = self.composition_order;
-                self.draw_command_batcher.queue(DrawCommand::Window {
-                    grid_id: grid,
-                    command: WindowDrawCommand::SortOrder(anchor.sort_order.clone()),
-                });
-            }
+        if let Some(window) = &mut window
+            && let Some(anchor) = window.anchor_info.as_mut()
+        {
+            // Neovim moves a window to the top of the layer each time the cursor enters it, so do the same here as well
+            self.composition_order += 1;
+            anchor.sort_order.composition_order = self.composition_order;
+            self.draw_command_batcher.queue(DrawCommand::Window {
+                grid_id: grid,
+                command: WindowDrawCommand::SortOrder(anchor.sort_order.clone()),
+            });
         }
 
-        if self.settings.get::<WindowSettings>().cursor_hack {
-            if let Some(Window { window_type: WindowType::Message { .. }, .. }) = window {
-                // When the user presses ":" to type a command, the cursor is sent to the gutter
-                // in position 1 (right after the ":"). In all other cases, we want to skip
-                // positioning to avoid confusing movements.
-                let intentional = grid_left == 1;
-                // If the cursor was already in this message, we can still move within it.
-                let already_there = self.cursor.parent_window_id == grid;
-                // This ^ check alone is a bit buggy though, since it fails when the cursor is
-                // technically still in the edit window but "temporarily" at the cmdline. (#1207)
-                let using_cmdline =
-                    self.current_mode_index.map(|current| current == MODE_CMDLINE).unwrap_or(false);
+        if self.settings.get::<WindowSettings>().cursor_hack
+            && let Some(Window { window_type: WindowType::Message { .. }, .. }) = window
+        {
+            // When the user presses ":" to type a command, the cursor is sent to the gutter
+            // in position 1 (right after the ":"). In all other cases, we want to skip
+            // positioning to avoid confusing movements.
+            let intentional = grid_left == 1;
+            // If the cursor was already in this message, we can still move within it.
+            let already_there = self.cursor.parent_window_id == grid;
+            // This ^ check alone is a bit buggy though, since it fails when the cursor is
+            // technically still in the edit window but "temporarily" at the cmdline. (#1207)
+            let using_cmdline = matches!(self.current_mode, EditorMode::CmdLine);
 
-                if !intentional && !already_there && !using_cmdline {
-                    trace!(
-                        "Cursor unexpectedly sent to message buffer {grid} ({grid_left}, {grid_top})"
-                    );
-                    return;
-                }
+            if !intentional && !already_there && !using_cmdline {
+                trace!(
+                    "Cursor unexpectedly sent to message buffer {grid} ({grid_left}, {grid_top})"
+                );
+                return;
             }
         }
 
@@ -729,6 +723,16 @@ impl Editor {
     }
 
     #[cfg(target_os = "macos")]
+    fn handle_highlight_group_set(&mut self, name: &str, id: u64) {
+        if name.starts_with("MatchParen") {
+            self.register_match_paren_highlight_id(id);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn handle_highlight_group_set(&mut self, _name: &str, _id: u64) {}
+
+    #[cfg(target_os = "macos")]
     fn grid_cell_text(&self, grid: u64, row: u64, column: u64) -> Option<String> {
         self.windows.get(&grid).and_then(|window| {
             let (text, _, _) = window.get_cursor_grid_cell(column, row);
@@ -740,18 +744,17 @@ impl Editor {
     fn match_paren_expected_char(&self) -> Option<char> {
         let (cursor_column, cursor_row) = self.cursor.grid_position;
         let cursor_grid = self.cursor.parent_window_id;
-        if let Some(text) = self.grid_cell_text(cursor_grid, cursor_row, cursor_column) {
-            if let Some(expected_char) = Self::match_paren_expected_char_from_text(&text) {
-                return Some(expected_char);
-            }
+        if let Some(text) = self.grid_cell_text(cursor_grid, cursor_row, cursor_column)
+            && let Some(expected_char) = Self::match_paren_expected_char_from_text(&text)
+        {
+            return Some(expected_char);
         }
 
-        if let Some(left_column) = cursor_column.checked_sub(1) {
-            if let Some(text) = self.grid_cell_text(cursor_grid, cursor_row, left_column) {
-                if let Some(expected_char) = Self::match_paren_expected_char_from_text(&text) {
-                    return Some(expected_char);
-                }
-            }
+        if let Some(left_column) = cursor_column.checked_sub(1)
+            && let Some(text) = self.grid_cell_text(cursor_grid, cursor_row, left_column)
+            && let Some(expected_char) = Self::match_paren_expected_char_from_text(&text)
+        {
+            return Some(expected_char);
         }
 
         Self::match_paren_expected_char_from_text(&self.cursor.grid_cell.0)
@@ -1133,15 +1136,15 @@ impl Editor {
     }
 
     fn maybe_inject_intro_banner(&mut self, grid: u64, banner_row: Option<u64>) {
-        if let Some(start_row) = banner_row {
-            if let Some(window) = self.windows.get_mut(&grid) {
-                self.intro_message_extender.inject_banner(
-                    grid,
-                    window,
-                    start_row,
-                    &mut self.draw_command_batcher,
-                );
-            }
+        if let Some(start_row) = banner_row
+            && let Some(window) = self.windows.get_mut(&grid)
+        {
+            self.intro_message_extender.inject_banner(
+                grid,
+                window,
+                start_row,
+                &mut self.draw_command_batcher,
+            );
         }
     }
 
