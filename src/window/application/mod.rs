@@ -1,38 +1,71 @@
-use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+//! Runs the winit event loop and presents failures for individual routes. The
+//! bridge sends session events by `RouteId`. The application gives them to
+//! `WinitWindowWrapper` and owns the error window shown if attachment fails.
 
-#[cfg(target_os = "macos")]
-use {
-    crate::bridge::{OpenArgs, send_or_queue_file_drop, set_active_route_handler},
-    crate::utils::resolve_relative_path,
-    std::path::Path,
-};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use glamour::Size2;
 use rustc_hash::FxHashMap;
-use winit::{
-    application::ApplicationHandler,
-    error::EventLoopError,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy},
-    window::WindowId,
-};
+use winit::application::ApplicationHandler;
+use winit::error::EventLoopError;
+use winit::event::WindowEvent;
+use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::ControlFlow;
+use winit::event_loop::EventLoop;
+use winit::event_loop::EventLoopProxy;
+use winit::window::WindowId;
 
-use super::{
-    CmdLineSettings, EventPayload, EventTarget, RouteId, WindowSettings, WindowSize,
-    WinitWindowWrapper, error_window, save_window_size,
-};
-use crate::{
-    clipboard::{Clipboard, ClipboardHandle},
-    profiling::{tracy_plot, tracy_zone},
-    renderer::DrawCommand,
-    running_tracker::RunningTracker,
-    settings::{AppHotReloadConfigs, HotReloadConfigs, Settings, font::FontSettings},
-    units::Grid,
-    window::UserEvent,
-};
+use super::EventPayload;
+use super::EventTarget;
+use super::RouteId;
+use super::WindowSettings;
+use super::WindowSize;
+use super::WinitWindowWrapper;
+use super::error_window;
+use crate::bridge::SessionTransition;
+use crate::bridge::TransitionFailure;
+use crate::clipboard::Clipboard;
+use crate::clipboard::ClipboardHandle;
+use crate::cmd_line::CmdLineSettings;
+use crate::profiling::tracy_plot;
+use crate::profiling::tracy_zone;
+use crate::renderer::DrawCommand;
+use crate::running_tracker::RunningTracker;
+use crate::settings::AppHotReloadConfigs;
+use crate::settings::HotReloadConfigs;
+use crate::settings::Settings;
+use crate::settings::font::FontSettings;
+use crate::settings::save_window_size;
+use crate::units::Grid;
+use crate::window::UserEvent;
+
+#[cfg_attr(target_os = "macos", path = "macos/mod.rs")]
+#[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "windows", path = "windows.rs")]
+pub mod platform;
+
+/// Present an attachment failure after the old route has been removed. A
+/// previous address is a recovery hint only. The old server may have exited or
+/// stopped listening by the time the error window appears.
+fn transition_failure_message(failure: &TransitionFailure) -> String {
+    match &failure.transition {
+        SessionTransition::Restart(details) => {
+            format!("Failed to restart Neovim on {:?}: {:#}", details.listen_addr, failure.cause)
+        }
+        SessionTransition::Connect { address, previous_address } => {
+            let cause = &failure.cause;
+            let mut message = format!("Failed to connect to Neovim at {address:?}: {cause:#}");
+            if let Some(server) = previous_address {
+                message += &format!("\nPrevious server: {server:?} (if still running).");
+            }
+            message += "\nTo retry, start Neovide with --server and the desired address.";
+            message
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum FocusedState {
@@ -129,6 +162,7 @@ pub struct Application {
     pub window_wrapper: WinitWindowWrapper,
     create_window_allowed: bool,
     proxy: EventLoopProxy<EventPayload>,
+    platform: platform::State,
     pub runtime_tracker: RunningTracker,
 
     settings: Arc<Settings>,
@@ -150,6 +184,7 @@ impl Application {
         let idle = cmd_line_settings.idle;
 
         let runtime_tracker = RunningTracker::new();
+        let platform = platform::State::new(&proxy);
 
         let window_wrapper = WinitWindowWrapper::new(
             initial_font_settings,
@@ -167,6 +202,7 @@ impl Application {
             window_wrapper,
             create_window_allowed: false,
             proxy,
+            platform,
             runtime_tracker,
 
             settings,
@@ -240,51 +276,6 @@ impl Application {
             if let Some(state) = self.render_states.get_mut(&window_id) {
                 state.should_render = ShouldRender::Immediately;
             }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn activate_focused_route(&self) {
-        let Some(window_id) = self.window_wrapper.get_focused_route() else {
-            return;
-        };
-
-        if let Some(route_id) = self.window_wrapper.route_id_for_window(window_id) {
-            set_active_route_handler(route_id);
-        }
-
-        self.window_wrapper.activate_and_focus_window(window_id);
-    }
-
-    #[cfg(target_os = "macos")]
-    fn prepare_open_files(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        new_window: bool,
-        cwd: Option<&Path>,
-        args: OpenArgs,
-    ) {
-        if !new_window {
-            self.activate_focused_route();
-            self.send_file_drops(args);
-            return;
-        }
-
-        if self.settings.get::<CmdLineSettings>().server.is_some() {
-            self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd, None);
-            self.mark_should_render_all();
-            self.send_file_drops(args);
-            return;
-        }
-
-        self.window_wrapper.try_create_window(event_loop, &self.proxy, cwd, Some(args));
-        self.mark_should_render_all();
-    }
-
-    #[cfg(target_os = "macos")]
-    fn send_file_drops(&self, args: OpenArgs) {
-        for path in args.files_to_open {
-            send_or_queue_file_drop(path, Some(args.tabs));
         }
     }
 
@@ -368,9 +359,7 @@ impl Application {
         self.render_states.values().map(|state| self.get_event_deadline_for(state)).min()
     }
 
-    fn next_control_flow(&self, now: Instant) -> ControlFlow {
-        next_control_flow_for(self.get_event_deadline(), !self.error_windows.is_empty(), now)
-    }
+    fn next_control_flow(&self) -> ControlFlow { next_control_flow_for(self.get_event_deadline()) }
 
     fn schedule_next_event(&mut self, event_loop: &ActiveEventLoop) {
         self.sync_render_states();
@@ -379,7 +368,7 @@ impl Application {
         if self.create_window_allowed && self.window_wrapper.has_pending_window_creation() {
             self.window_wrapper.try_create_window(event_loop, &self.proxy, None, None);
         }
-        event_loop.set_control_flow(self.next_control_flow(Instant::now()));
+        event_loop.set_control_flow(self.next_control_flow());
     }
 
     fn handle_error_window_event(
@@ -403,6 +392,26 @@ impl Application {
     fn exit_if_no_windows_remain(&self, event_loop: &ActiveEventLoop) {
         if self.window_wrapper.is_empty() && self.error_windows.is_empty() {
             event_loop.exit();
+        }
+    }
+
+    fn show_neovim_error(&mut self, event_loop: &ActiveEventLoop, message: String) {
+        let window_config = error_window::create_error_window(event_loop, &self.settings);
+        #[cfg(target_os = "windows")]
+        let error_window = window_config.window.clone();
+        let clipboard_handle = ClipboardHandle::new(self.clipboard.as_ref().unwrap());
+        let state = error_window::State::new(
+            &message,
+            window_config,
+            self.settings.clone(),
+            clipboard_handle,
+        );
+
+        self.error_windows.insert(state.window_id(), (state, message));
+        #[cfg(target_os = "windows")]
+        {
+            // Windows can leave the new error window behind the recovered editor.
+            error_window.focus_window();
         }
     }
 
@@ -499,7 +508,7 @@ impl Application {
 
     fn process_buffered_draw_commands(&mut self, window_id: WindowId) {
         let pending_batches = match self.render_states.get_mut(&window_id) {
-            Some(state) => state.pending_draw_commands.drain(..).collect::<Vec<_>>(),
+            Some(state) => std::mem::take(&mut state.pending_draw_commands),
             None => return,
         };
         if !pending_batches.is_empty() {
@@ -709,28 +718,8 @@ impl ApplicationHandler<EventPayload> for Application {
         match payload {
             UserEvent::ConfigsChanged(config) => self.handle_config_changed(target, *config),
             #[cfg(target_os = "macos")]
-            UserEvent::OpenFiles {
-                files,
-                cwd,
-                caller_cwd,
-                tabs,
-                new_window,
-                neovim_bin,
-                neovim_args,
-            } => {
-                let cwd = cwd.as_deref().map(Path::new);
-                let caller_cwd = caller_cwd.as_deref().map(Path::new);
-                let open_args = OpenArgs {
-                    files_to_open: files
-                        .into_iter()
-                        .map(|path| resolve_relative_path(&path, caller_cwd))
-                        .collect(),
-                    tabs,
-                    neovim_bin,
-                    neovim_args,
-                };
-
-                self.prepare_open_files(event_loop, new_window, cwd, open_args);
+            open_files @ UserEvent::OpenFiles { .. } => {
+                self.handle_open_files(event_loop, open_files);
             }
             UserEvent::NeovimExited => {
                 let route_id = self.route_id_for_target(target);
@@ -743,7 +732,12 @@ impl ApplicationHandler<EventPayload> for Application {
                 if remaining_before <= 1 && window_id.is_some() {
                     save_window_size(&self.window_wrapper, &self.settings);
                 }
-                self.window_wrapper.handle_neovim_exit_route(route_id, &self.proxy);
+                let failure = self.window_wrapper.handle_neovim_exit_route(route_id, &self.proxy);
+                if let Some(failure) = failure {
+                    let message = transition_failure_message(&failure);
+                    log::error!("{message}");
+                    self.show_neovim_error(event_loop, message);
+                }
                 if let Some(window_id) = window_id {
                     self.render_states.remove(&window_id);
                 }
@@ -834,34 +828,29 @@ impl ApplicationHandler<EventPayload> for Application {
                 self.mark_should_render_all();
             }
             #[cfg(target_os = "macos")]
+            UserEvent::ActivateWindow(window_id) => {
+                self.window_wrapper.activate_and_focus_window(window_id);
+            }
+            #[cfg(target_os = "macos")]
             UserEvent::MacShortcut(command) => {
                 self.window_wrapper.handle_mac_shortcut(command);
                 self.mark_should_render_all();
             }
-            UserEvent::NeovimLaunchError { message } => {
-                let window_config = error_window::create_error_window(event_loop, &self.settings);
-                let clipboard_handle = ClipboardHandle::new(self.clipboard.as_ref().unwrap());
-                let state = error_window::State::new(
-                    &message,
-                    window_config,
-                    self.settings.clone(),
-                    clipboard_handle,
-                );
-                let window_id = state.window_id();
-                self.error_windows.insert(window_id, (state, message));
+            UserEvent::NeovimLaunchError { message }
+            | UserEvent::NeovimTransitionRecovered { message } => {
+                self.show_neovim_error(event_loop, message);
             }
-            UserEvent::NeovimRestart(details) => {
+            UserEvent::NeovimTransition { request_id, transition } => {
                 let route_id = self.route_id_for_target(target);
                 let Some(route_id) = route_id else {
-                    log::warn!("NeovimRestart event missing window/route target");
+                    log::warn!("NeovimTransition event missing window/route target");
                     return;
                 };
-                self.window_wrapper.queue_restart_route(route_id, details);
-                if let Some(window_id) = self.window_wrapper.window_id_for_route(route_id)
-                    && let Some(state) = self.render_states.get_mut(&window_id)
-                {
-                    state.pending_draw_commands.clear();
-                    state.should_render = ShouldRender::Immediately;
+                self.window_wrapper.queue_session_transition(route_id, request_id, transition);
+            }
+            UserEvent::NeovimRestartAborted { request_id } => {
+                if let Some(route_id) = self.route_id_for_target(target) {
+                    self.window_wrapper.cancel_aborted_restart(route_id, request_id);
                 }
             }
             payload => {
@@ -888,12 +877,14 @@ impl ApplicationHandler<EventPayload> for Application {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         tracy_zone!("resumed");
         self.create_window_allowed = true;
+        self.platform.resumed(&self.proxy);
         self.window_wrapper.request_window_creation(&self.proxy);
         self.schedule_next_event(event_loop);
     }
 
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
         tracy_zone!("exiting");
+        self.platform.exiting();
         self.teardown();
         self.error_windows.clear();
         self.window_wrapper.exit();
@@ -903,18 +894,38 @@ impl ApplicationHandler<EventPayload> for Application {
 
 impl Drop for Application {
     fn drop(&mut self) {
+        self.platform.exiting();
         self.teardown();
     }
 }
 
-fn next_control_flow_for(
-    deadline: Option<Instant>,
-    has_error_windows: bool,
-    now: Instant,
-) -> ControlFlow {
+fn next_control_flow_for(deadline: Option<Instant>) -> ControlFlow {
     match deadline {
         Some(deadline) => ControlFlow::WaitUntil(deadline),
-        None if has_error_windows => ControlFlow::Wait,
-        None => ControlFlow::WaitUntil(now),
+        None => ControlFlow::Wait,
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::transition_failure_message;
+    use crate::bridge::SessionTransition;
+    use crate::bridge::TransitionFailure;
+
+    #[test]
+    fn failed_connect_shows_destination_cause_and_recovery_address() {
+        let failure = TransitionFailure {
+            transition: SessionTransition::Connect {
+                address: "/tmp/missing.sock".to_owned(),
+                previous_address: Some("/tmp/previous.sock".to_owned()),
+            },
+            cause: anyhow::anyhow!("connection refused"),
+        };
+
+        let message = transition_failure_message(&failure);
+        assert!(message.contains("/tmp/missing.sock"));
+        assert!(message.contains("connection refused"));
+        assert!(message.contains("/tmp/previous.sock"));
+        assert!(message.contains("--server"));
     }
 }

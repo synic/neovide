@@ -1,7 +1,11 @@
-use std::{collections::HashSet, fmt, hash::Hash};
+use std::collections::HashSet;
+use std::fmt;
+use std::hash::Hash;
 
 use itertools::Itertools;
-use rmpv::{Utf8StringRef, Value, ValueRef};
+use rmpv::Utf8StringRef;
+use rmpv::Value;
+use rmpv::ValueRef;
 
 #[cfg(test)]
 use crate::bridge::nvim_dict;
@@ -12,21 +16,15 @@ pub struct ApiInfoParseError(String);
 impl std::error::Error for ApiInfoParseError {}
 
 impl fmt::Display for ApiInfoParseError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { write!(f, "{}", self.0) }
 }
 
 impl From<ValueRef<'_>> for ApiInfoParseError {
-    fn from(value: ValueRef) -> Self {
-        Self(format!("{value}"))
-    }
+    fn from(value: ValueRef) -> Self { Self(format!("{value}")) }
 }
 
 impl From<&str> for ApiInfoParseError {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
-    }
+    fn from(value: &str) -> Self { Self(value.to_owned()) }
 }
 
 #[allow(unused)]
@@ -52,14 +50,12 @@ impl ApiVersion {
     /// See the tests for more examples.
     #[allow(dead_code)]
     pub fn has_version(&self, major: u64, minor: u64, patch: u64, prerelease: Option<u64>) -> bool {
-        self.major > major
-            || (self.major == major && self.minor > minor)
-            || ((self.major == major && self.minor == minor && self.patch >= patch)
-                && !self.prerelease)
-            || (self.major == major
-                && self.minor == minor
-                && self.patch == patch
-                && matches!(prerelease, Some(prerelease) if self.prerelease_version >= prerelease))
+        let version = (self.major, self.minor, self.patch);
+        let required = (major, minor, patch);
+        version > required
+            || (version == required
+                && (!self.prerelease
+                    || matches!(prerelease, Some(prerelease) if self.prerelease_version >= prerelease)))
     }
 }
 
@@ -75,15 +71,11 @@ pub struct ApiFunction {
 }
 
 impl Hash for ApiFunction {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state)
-    }
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.name.hash(state) }
 }
 
 impl PartialEq for ApiFunction {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
+    fn eq(&self, other: &Self) -> bool { self.name == other.name }
 }
 
 impl Eq for ApiFunction {}
@@ -118,7 +110,7 @@ impl ApiParameterType {
             Some("Float") => ApiParameterType::Float,
             Some("String") => ApiParameterType::String,
             Some("Array") => ApiParameterType::Array,
-            Some("Dictionary") => ApiParameterType::Dictionary,
+            Some("Dict") | Some("Dictionary") => ApiParameterType::Dictionary,
             Some("Object") => ApiParameterType::Object,
             Some("Buffer") => ApiParameterType::Buffer,
             Some("Window") => ApiParameterType::Window,
@@ -151,6 +143,7 @@ impl ApiParameterType {
 pub struct ApiParameter {
     pub name: String,
     pub parameter_type: ApiParameterType,
+    pub optional: Option<bool>,
 }
 
 #[allow(unused)]
@@ -162,15 +155,11 @@ pub struct ApiEvent {
 }
 
 impl Hash for ApiEvent {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state)
-    }
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) { self.name.hash(state) }
 }
 
 impl PartialEq for ApiEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-    }
+    fn eq(&self, other: &Self) -> bool { self.name == other.name }
 }
 
 impl Eq for ApiEvent {}
@@ -304,16 +293,25 @@ fn parse_parameter_type(
 
 fn parse_parameter(value: ValueRef) -> std::result::Result<ApiParameter, ApiInfoParseError> {
     let info: Vec<ValueRef> = value.try_into()?;
-    if let Some((t, n)) = info.into_iter().collect_tuple() {
-        let name: Utf8StringRef = n.try_into()?;
-        let name = name.as_str();
-        let parameter_type = parse_parameter_type(t)?;
-        Ok(ApiParameter {
-            name: name.map_or(Err("name field is missing"), |v| Ok(v.to_owned()))?,
-            parameter_type,
-        })
-    } else {
-        Err("Invalid parameter".into())
+
+    match info.as_slice() {
+        [parameter_type, name, optional @ ..] => {
+            let optional = match optional {
+                [] => None,
+                [ValueRef::Boolean(optional)] => Some(*optional),
+                _ => return Err("unexpected optional field".into()),
+            };
+
+            let name: Utf8StringRef = name.clone().try_into()?;
+            let parameter_type = parse_parameter_type(parameter_type.clone())?;
+
+            Ok(ApiParameter {
+                name: name.as_str().ok_or("name field is missing")?.to_owned(),
+                parameter_type,
+                optional,
+            })
+        }
+        _ => Err("Invalid parameter".into()),
     }
 }
 

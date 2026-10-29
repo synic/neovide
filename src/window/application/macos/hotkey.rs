@@ -1,28 +1,30 @@
 use std::collections::HashSet;
-use std::{
-    env::{self, VarError},
-    fmt,
-    mem::{self, MaybeUninit},
-    os::raw::c_void,
-    ptr,
-};
+use std::env::VarError;
+use std::env::{self};
+use std::fmt;
+use std::mem::MaybeUninit;
+use std::mem::{self};
+use std::os::raw::c_void;
+use std::ptr;
 
-use log::{info, warn};
+use log::info;
+use log::warn;
 use objc2_app_kit::NSEventModifierFlags;
 use winit::event_loop::EventLoopProxy;
 
-use crate::window::{EventPayload, MacShortcutCommand, UserEvent};
+use crate::window::EventPayload;
+use crate::window::MacShortcutCommand;
+use crate::window::UserEvent;
 
 const PINNED_ENV_VAR: &str = "NEOVIDE_SYSTEM_PINNED_HOTKEY";
 const SWITCHER_ENV_VAR: &str = "NEOVIDE_SYSTEM_SWITCHER_HOTKEY";
-const LEGACY_ENV_VAR: &str = "NEOVIDE_MACOS_ACTIVATION_HOTKEY";
 
 const PINNED_DEFAULT: &str = "cmd+ctrl+z";
 const SWITCHER_DEFAULT: &str = "cmd+ctrl+n";
 
 const HOTKEY_SIGNATURE: u32 = u32::from_be_bytes(*b"NEOV");
 const EVENT_CLASS_KEYBOARD: u32 = u32::from_be_bytes(*b"keyb");
-const EVENT_KIND_HOT_KEY_PRESSED: u32 = 6;
+const EVENT_KIND_HOT_KEY_PRESSED: u32 = 5;
 const EVENT_PARAM_DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
 const TYPE_EVENT_HOT_KEY_ID: u32 = u32::from_be_bytes(*b"hkid");
 const NO_ERR: OSStatus = 0;
@@ -94,7 +96,7 @@ const HOTKEY_DEFINITIONS: &[HotkeyDefinition] = &[
     },
     HotkeyDefinition {
         action: ShortcutAction::ShowEditorSwitcher,
-        env_vars: &[SWITCHER_ENV_VAR, LEGACY_ENV_VAR],
+        env_vars: &[SWITCHER_ENV_VAR],
         default: SWITCHER_DEFAULT,
     },
 ];
@@ -358,13 +360,9 @@ fn shortcut_choice<'a>(env_vars: &'a [&str], default: &'a str) -> Option<String>
     Some(default.to_string())
 }
 
-fn is_disabled_keyword(value: &str) -> bool {
-    matches_ignore_case(value.trim(), "false")
-}
+fn is_disabled_keyword(value: &str) -> bool { matches_ignore_case(value.trim(), "false") }
 
-fn matches_ignore_case(value: &str, keyword: &str) -> bool {
-    value.eq_ignore_ascii_case(keyword)
-}
+fn matches_ignore_case(value: &str, keyword: &str) -> bool { value.eq_ignore_ascii_case(keyword) }
 
 #[derive(Clone, Copy)]
 struct ActivationShortcut {

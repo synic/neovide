@@ -41,6 +41,8 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
         toolchain: [stable, nightly]
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
 
     steps:
       - uses: actions/checkout@v4
@@ -57,7 +59,7 @@ jobs:
         uses: rhysd/action-setup-vim@v1
         with:
           neovim: true
-
+          version: v0.12.0
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -104,6 +106,8 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
         toolchain: [stable, nightly]
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
 
     steps:
       - uses: actions/checkout@v4
@@ -143,6 +147,8 @@ jobs:
         # NOTE: Should use the oldest available Ubuntu release, for maximum compatibility
         os: [windows-latest, macos-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: stable
 
     steps:
       - uses: actions/checkout@v4
@@ -197,6 +203,7 @@ jobs:
         uses: rhysd/action-setup-vim@v1
         with:
           neovim: true
+          version: v0.12.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -248,7 +255,9 @@ jobs:
           p12_file: key.p12
           p12_password: ${{ secrets.APPLE_SIGNING_KEY_PASSWORD }}
           sign: true
-          sign_args: "--code-signature-flags=runtime"
+          sign_args: |-
+            --code-signature-flags=runtime
+            --entitlements-xml-file=macos-builder/Neovide.entitlements
 
       - name: Sign Mac App binary (aarch64-apple-darwin)
         if: matrix.os == 'macos-latest' && github.ref == 'refs/heads/main'
@@ -258,7 +267,9 @@ jobs:
           p12_file: key.p12
           p12_password: ${{ secrets.APPLE_SIGNING_KEY_PASSWORD }}
           sign: true
-          sign_args: "--code-signature-flags=runtime"
+          sign_args: |-
+            --code-signature-flags=runtime
+            --entitlements-xml-file=macos-builder/Neovide.entitlements
 
       - name: Sign Mac App .app (aarch64-apple-darwin)
         if: matrix.os == 'macos-latest' && github.ref == 'refs/heads/main'
@@ -268,7 +279,9 @@ jobs:
           p12_file: key.p12
           p12_password: ${{ secrets.APPLE_SIGNING_KEY_PASSWORD }}
           sign: true
-          sign_args: "--code-signature-flags=runtime"
+          sign_args: |-
+            --code-signature-flags=runtime
+            --entitlements-xml-file=macos-builder/Neovide.entitlements
 
       - name: Sign Mac App binary root (x86_64-apple-darwin)
         if: matrix.os == 'macos-latest' && github.ref == 'refs/heads/main'
@@ -278,7 +291,9 @@ jobs:
           p12_file: key.p12
           p12_password: ${{ secrets.APPLE_SIGNING_KEY_PASSWORD }}
           sign: true
-          sign_args: "--code-signature-flags=runtime"
+          sign_args: |-
+            --code-signature-flags=runtime
+            --entitlements-xml-file=macos-builder/Neovide.entitlements
 
       - name: Sign Mac App binary (x86_64-apple-darwin)
         if: matrix.os == 'macos-latest' && github.ref == 'refs/heads/main'
@@ -288,7 +303,9 @@ jobs:
           p12_file: key.p12
           p12_password: ${{ secrets.APPLE_SIGNING_KEY_PASSWORD }}
           sign: true
-          sign_args: "--code-signature-flags=runtime"
+          sign_args: |-
+            --code-signature-flags=runtime
+            --entitlements-xml-file=macos-builder/Neovide.entitlements
 
       - name: Sign Mac App .app (x86_64-apple-darwin)
         if: matrix.os == 'macos-latest' && github.ref == 'refs/heads/main'
@@ -298,7 +315,9 @@ jobs:
           p12_file: key.p12
           p12_password: ${{ secrets.APPLE_SIGNING_KEY_PASSWORD }}
           sign: true
-          sign_args: "--code-signature-flags=runtime"
+          sign_args: |-
+            --code-signature-flags=runtime
+            --entitlements-xml-file=macos-builder/Neovide.entitlements
 
       - name: Prepare Artifacts (Windows)
         if: matrix.os == 'windows-latest'

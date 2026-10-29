@@ -1,25 +1,29 @@
 //! Config file handling
 
-use std::{env, fs, sync::mpsc, time::Duration};
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::time::Duration;
 
-use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
-use serde::{
-    Deserialize, Deserializer,
-    de::{Error as DeError, Unexpected},
-};
+use notify_debouncer_full::DebouncedEvent;
+use notify_debouncer_full::new_debouncer;
+use notify_debouncer_full::notify::RecursiveMode;
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::de::Error as DeError;
+use serde::de::Unexpected;
 use winit::event_loop::EventLoopProxy;
 
-use crate::{
-    cmd_line::{GeometryArgs, MouseCursorIcon},
-    error_msg,
-    frame::Frame,
-    renderer::box_drawing::BoxDrawingSettings,
-    window::{EventPayload, UserEvent},
-};
-
-use std::path::{Path, PathBuf};
-
 use super::font::FontSettings;
+use crate::cmd_line::GeometryArgs;
+use crate::cmd_line::MouseCursorIcon;
+use crate::error_msg;
+use crate::frame::Frame;
+use crate::renderer::box_drawing::BoxDrawingSettings;
+use crate::window::EventPayload;
+use crate::window::UserEvent;
 
 const CONFIG_FILE: &str = "config.toml";
 
@@ -56,9 +60,7 @@ enum HotkeyConfigValue {
 }
 
 fn deserialize_optional_hotkey<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
+where D: Deserializer<'de> {
     match Option::<HotkeyConfigValue>::deserialize(deserializer)? {
         None => Ok(None),
         Some(HotkeyConfigValue::String(value)) => Ok(Some(value)),
@@ -84,6 +86,7 @@ pub struct Config {
     pub neovim_bin: Option<PathBuf>,
     pub no_multigrid: Option<bool>,
     pub srgb: Option<bool>,
+    pub startup_message_capture: Option<bool>,
     pub tabs: Option<bool>,
     pub system_native_tabs: Option<bool>,
     pub mouse_cursor_icon: Option<String>,
@@ -181,6 +184,11 @@ impl Config {
         }
         if let Some(srgb) = self.srgb {
             unsafe { env::set_var("NEOVIDE_SRGB", srgb.to_string()) };
+        }
+        if let Some(startup_message_capture) = self.startup_message_capture {
+            unsafe {
+                env::set_var("NEOVIDE_STARTUP_MESSAGE_CAPTURE", startup_message_capture.to_string())
+            };
         }
         if let Some(fork) = self.fork {
             unsafe { env::set_var("NEOVIDE_FORK", fork.to_string()) };
@@ -308,8 +316,21 @@ fn watcher_thread(init_config: Config, event_loop_proxy: EventLoopProxy<EventPay
 
     let mut previous_config = init_config;
     loop {
-        if let Err(e) = rx.recv() {
-            eprintln!("Error while watching config file: {e}");
+        let events = match rx.recv() {
+            Ok(Ok(events)) => events,
+            Ok(Err(errors)) => {
+                for error in errors {
+                    log::warn!("Error while watching config file: {error}");
+                }
+                continue;
+            }
+            Err(error) => {
+                log::warn!("Config file watcher stopped: {error}");
+                return;
+            }
+        };
+
+        if !events_relevant_to_config(&events, &config_path) {
             continue;
         }
 
@@ -396,5 +417,59 @@ fn watcher_thread(init_config: Config, event_loop_proxy: EventLoopProxy<EventPay
             }
         }
         previous_config = config;
+    }
+}
+
+fn events_relevant_to_config(events: &[DebouncedEvent], config_path: &Path) -> bool {
+    events.iter().any(|event| {
+        event.event.need_rescan() || event.event.paths.iter().any(|path| path == config_path)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use notify_debouncer_full::DebouncedEvent;
+    use notify_debouncer_full::notify::Event;
+    use notify_debouncer_full::notify::EventKind;
+    use notify_debouncer_full::notify::event::Flag;
+
+    use super::*;
+
+    fn event_with_paths(paths: &[&str]) -> DebouncedEvent {
+        let event = paths
+            .iter()
+            .fold(Event::new(EventKind::Any), |event, path| event.add_path(PathBuf::from(path)));
+        DebouncedEvent::new(event, Instant::now())
+    }
+
+    #[test]
+    fn ignores_events_for_other_files_in_config_directory() {
+        let events = [event_with_paths(&["/tmp/.config.toml.swp"])];
+
+        assert!(!events_relevant_to_config(&events, Path::new("/tmp/config.toml")));
+    }
+
+    #[test]
+    fn accepts_events_for_config_file() {
+        let events = [event_with_paths(&["/tmp/config.toml"])];
+
+        assert!(events_relevant_to_config(&events, Path::new("/tmp/config.toml")));
+    }
+
+    #[test]
+    fn accepts_atomic_rename_to_config_file() {
+        let events = [event_with_paths(&["/tmp/config.toml.tmp", "/tmp/config.toml"])];
+
+        assert!(events_relevant_to_config(&events, Path::new("/tmp/config.toml")));
+    }
+
+    #[test]
+    fn accepts_events_that_require_a_rescan() {
+        let event = Event::new(EventKind::Any).set_flag(Flag::Rescan);
+        let events = [DebouncedEvent::new(event, Instant::now())];
+
+        assert!(events_relevant_to_config(&events, Path::new("/tmp/config.toml")));
     }
 }

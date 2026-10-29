@@ -1,19 +1,24 @@
-use std::{
-    convert::TryInto,
-    error,
-    fmt::{self, Debug},
-};
+use std::convert::TryInto;
+use std::error;
+use std::fmt::Debug;
+use std::fmt::{self};
+use std::io::Cursor;
 
-use log::{debug, warn};
+use log::debug;
+use log::warn;
 use rmpv::Value;
+use rmpv::decode::read_value;
 use skia_safe::Color4f;
 use strum::AsRefStr;
 
 use super::RestartDetails;
-use crate::{
-    editor::{Colors, CursorMode, CursorShape, Style, UnderlineStyle},
-    window::UserEvent,
-};
+use crate::editor::Colors;
+use crate::editor::CursorMode;
+use crate::editor::CursorShape;
+use crate::editor::Style;
+use crate::editor::UnderlineStyle;
+use crate::window::ProgressBarUpdate;
+use crate::window::UserEvent;
 
 #[derive(Clone, Debug)]
 pub enum ParseError {
@@ -50,9 +55,7 @@ impl fmt::Display for ParseError {
 }
 
 impl error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        None
-    }
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> { None }
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +74,7 @@ pub struct GridLineCell {
 
 pub type StyledContent = Vec<(u64, String)>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MessageKind {
     Unknown,
     Confirm,
@@ -106,6 +109,33 @@ impl MessageKind {
             _ => MessageKind::Unknown,
         }
     }
+
+    pub fn is_error(self) -> bool {
+        matches!(
+            self,
+            MessageKind::Error
+                | MessageKind::EchoError
+                | MessageKind::LuaError
+                | MessageKind::RpcError
+        )
+    }
+
+    pub fn highlight_group(self) -> Option<&'static str> {
+        match self {
+            MessageKind::Warning => Some("WarningMsg"),
+            MessageKind::Error
+            | MessageKind::EchoError
+            | MessageKind::LuaError
+            | MessageKind::RpcError => Some("ErrorMsg"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupMessage {
+    pub kind: MessageKind,
+    pub content: String,
 }
 
 #[allow(unused)]
@@ -160,6 +190,12 @@ pub enum RedrawEvent {
     /// Request the UI to restart Neovim.
     Restart {
         details: RestartDetails,
+    },
+    /// The `connect` event sent by neovim to the current UI. It carries only
+    /// the destination. The handler forwards it to the window wrapper, which
+    /// waits for an exit report from this session before switching.
+    Connect {
+        address: String,
     },
     ModeInfoSet {
         cursor_modes: Vec<CursorMode>,
@@ -284,6 +320,7 @@ pub enum RedrawEvent {
     /// previously hidden, it should now be shown again.
     WindowPosition {
         grid: u64,
+        window: u64,
         start_row: u64,
         start_column: u64,
         width: u64,
@@ -357,6 +394,8 @@ pub enum RedrawEvent {
     WindowViewport {
         grid: u64,
         #[allow(unused)]
+        window: u64,
+        #[allow(unused)]
         top_line: f64,
         #[allow(unused)]
         bottom_line: f64,
@@ -417,6 +456,7 @@ pub enum RedrawEvent {
         kind: MessageKind,
         content: StyledContent,
         replace_last: bool,
+        append: bool,
     },
     MessageClear,
     #[allow(unused)]
@@ -436,8 +476,23 @@ pub enum RedrawEvent {
         entries: Vec<(MessageKind, StyledContent)>,
     },
     Suspend,
+    NeovimSessionStarted,
+    StartupMessageUiRestored,
     NeovideSetRedraw(bool),
+    #[cfg(target_os = "macos")]
+    ScrollbarWindow {
+        window: u64,
+        metadata: Option<ScrollbarWindowMetadata>,
+    },
     NeovideIntroBannerAllowed(bool),
+}
+
+/// Buffer identity and scrollbar eligibility reported for a Neovim window.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollbarWindowMetadata {
+    pub buffer: u64,
+    pub eligible: bool,
 }
 
 fn unpack_color(packed_color: u64) -> Color4f {
@@ -476,7 +531,7 @@ fn extract_values_with_optional<const REQ: usize, const OPT: usize>(
         for (index, value) in values.into_iter().enumerate() {
             if index < REQ {
                 required_values[index] = value;
-            } else {
+            } else if index - REQ < OPT {
                 optional_values[index - REQ] = Some(value);
             }
         }
@@ -500,21 +555,25 @@ fn parse_string(string_value: Value) -> Result<String> {
     }
 }
 
-fn parse_u64(u64_value: Value) -> Result<u64> {
-    u64_value.try_into().map_err(ParseError::U64)
+fn parse_u64(u64_value: Value) -> Result<u64> { u64_value.try_into().map_err(ParseError::U64) }
+
+fn parse_handle_u64(value: Value) -> Result<u64> {
+    match value {
+        Value::Ext(_, data) => {
+            let mut cursor = Cursor::new(data);
+            let inner =
+                read_value(&mut cursor).map_err(|_| ParseError::Format("invalid handle".into()))?;
+            parse_u64(inner)
+        }
+        other => parse_u64(other),
+    }
 }
 
-fn parse_i64(i64_value: Value) -> Result<i64> {
-    i64_value.try_into().map_err(ParseError::I64)
-}
+fn parse_i64(i64_value: Value) -> Result<i64> { i64_value.try_into().map_err(ParseError::I64) }
 
-fn parse_f64(f64_value: Value) -> Result<f64> {
-    f64_value.try_into().map_err(ParseError::F64)
-}
+fn parse_f64(f64_value: Value) -> Result<f64> { f64_value.try_into().map_err(ParseError::F64) }
 
-fn parse_bool(bool_value: Value) -> Result<bool> {
-    bool_value.try_into().map_err(ParseError::Bool)
-}
+fn parse_bool(bool_value: Value) -> Result<bool> { bool_value.try_into().map_err(ParseError::Bool) }
 
 fn parse_set_title(set_title_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let [title] = extract_values(set_title_arguments)?;
@@ -523,10 +582,15 @@ fn parse_set_title(set_title_arguments: Vec<Value>) -> Result<RedrawEvent> {
 }
 
 fn parse_restart(arguments: Vec<Value>) -> Result<RedrawEvent> {
-    RestartDetails::from_values(&arguments).map_or_else(
-        || Err(ParseError::Format(format!("invalid restart event: {arguments:?}"))),
-        |details| Ok(RedrawEvent::Restart { details }),
-    )
+    RestartDetails::from_values(arguments).map(|details| RedrawEvent::Restart { details })
+}
+
+fn parse_connect(arguments: Vec<Value>) -> Result<RedrawEvent> {
+    let address = arguments
+        .into_iter()
+        .next()
+        .ok_or_else(|| ParseError::Format("connect event missing address".to_owned()))?;
+    Ok(RedrawEvent::Connect { address: parse_string(address)? })
 }
 
 fn parse_mode_info_set(mode_info_set_arguments: Vec<Value>) -> Result<RedrawEvent> {
@@ -734,9 +798,7 @@ fn parse_hl_group_set(hl_group_set_arguments: Vec<Value>) -> Result<RedrawEvent>
 }
 
 fn parse_grid_line_cell(grid_line_cell: Value) -> Result<GridLineCell> {
-    fn take_value(val: &mut Value) -> Value {
-        std::mem::replace(val, Value::Nil)
-    }
+    fn take_value(val: &mut Value) -> Value { std::mem::replace(val, Value::Nil) }
 
     let mut cell_contents = parse_array(grid_line_cell)?;
 
@@ -829,11 +891,11 @@ fn parse_grid_scroll(grid_scroll_arguments: Vec<Value>) -> Result<RedrawEvent> {
 }
 
 fn parse_win_pos(win_pos_arguments: Vec<Value>) -> Result<RedrawEvent> {
-    let [grid, _window, start_row, start_column, width, height] =
-        extract_values(win_pos_arguments)?;
+    let [grid, window, start_row, start_column, width, height] = extract_values(win_pos_arguments)?;
 
     Ok(RedrawEvent::WindowPosition {
         grid: parse_u64(grid)?,
+        window: parse_handle_u64(window)?,
         start_row: parse_u64(start_row)?,
         start_column: parse_u64(start_column)?,
         width: parse_u64(width)?,
@@ -906,12 +968,13 @@ fn parse_msg_set_pos(msg_set_pos_arguments: Vec<Value>) -> Result<RedrawEvent> {
 
 fn parse_win_viewport(win_viewport_arguments: Vec<Value>) -> Result<RedrawEvent> {
     let (
-        [grid, _window, top_line, bottom_line, current_line, current_column],
+        [grid, window, top_line, bottom_line, current_line, current_column],
         [line_count, scroll_delta],
     ) = extract_values_with_optional(win_viewport_arguments)?;
 
     Ok(RedrawEvent::WindowViewport {
         grid: parse_u64(grid)?,
+        window: parse_handle_u64(window)?,
         top_line: parse_f64(top_line)?,
         bottom_line: parse_f64(bottom_line)?,
         current_line: parse_f64(current_line)?,
@@ -992,12 +1055,14 @@ fn parse_cmdline_block_append(cmdline_block_append_arguments: Vec<Value>) -> Res
 }
 
 fn parse_msg_show(msg_show_arguments: Vec<Value>) -> Result<RedrawEvent> {
-    let [kind, content, replace_last] = extract_values(msg_show_arguments)?;
+    let ([kind, content, replace_last], [_history, append, _id, _trigger]) =
+        extract_values_with_optional(msg_show_arguments)?;
 
     Ok(RedrawEvent::MessageShow {
         kind: MessageKind::parse(&parse_string(kind)?),
         content: parse_styled_content(content)?,
         replace_last: parse_bool(replace_last)?,
+        append: append.map(parse_bool).transpose()?.unwrap_or(false),
     })
 }
 
@@ -1052,6 +1117,7 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
         let possible_parsed_event = match event_name.as_str() {
             "set_title" => Some(parse_set_title(event_parameters)),
             "restart" => Some(parse_restart(event_parameters)),
+            "connect" => Some(parse_connect(event_parameters)),
             "set_icon" => None, // Ignore set icon for now
             "mode_info_set" => Some(parse_mode_info_set(event_parameters)),
             "option_set" => Some(parse_option_set(event_parameters)),
@@ -1112,13 +1178,111 @@ pub fn parse_redraw_event(event_value: Value) -> Result<Vec<RedrawEvent>> {
     Ok(parsed_events)
 }
 
+fn parse_map_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    map.iter().find_map(|(name, value)| (name.as_str() == Some(key)).then_some(value))
+}
+
+fn parse_progress_id(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .or_else(|| value.as_i64().map(|value| value.to_string()))
+        .or_else(|| value.as_u64().map(|value| value.to_string()))
+}
+
+fn parse_progress_string(value: &Value) -> Option<String> { value.as_str().map(ToOwned::to_owned) }
+
+fn parse_progress_percent(value: &Value) -> Option<f32> {
+    value
+        .as_f64()
+        .map(|value| value as f32)
+        .or_else(|| value.as_i64().map(|value| value as f32))
+        .or_else(|| value.as_u64().map(|value| value as f32))
+}
+
 pub fn parse_progress_bar_event(value: Option<&Value>) -> Option<UserEvent> {
     let map = value.filter(|v| matches!(v, Value::Map(_)))?.as_map()?;
-    let percent = map
-        .iter()
-        .find(|(key, _)| key.as_str() == Some("percent"))
-        .and_then(|(_, value)| value.as_f64())
-        .unwrap_or(0.0) as f32;
+    let update = ProgressBarUpdate {
+        id: parse_map_field(map, "id").and_then(parse_progress_id),
+        source: parse_map_field(map, "source").and_then(parse_progress_string),
+        status: parse_map_field(map, "status").and_then(parse_progress_string),
+        percent: parse_map_field(map, "percent").and_then(parse_progress_percent),
+    };
 
-    Some(UserEvent::ShowProgressBar { percent })
+    Some(UserEvent::ShowProgressBar { update })
+}
+
+#[cfg(test)]
+mod tests {
+    use rmpv::Value;
+
+    use super::MessageKind;
+    use super::RedrawEvent;
+    use super::parse_msg_show;
+    use super::parse_redraw_event;
+
+    #[test]
+    fn connect_ui_event_carries_destination_address() {
+        let event = Value::Array(vec![
+            Value::from("connect"),
+            Value::Array(vec![Value::from("/tmp/other-nvim.sock")]),
+        ]);
+
+        let parsed = parse_redraw_event(event).unwrap();
+        assert!(matches!(
+            parsed.as_slice(),
+            [RedrawEvent::Connect { address }] if address == "/tmp/other-nvim.sock"
+        ));
+    }
+
+    #[test]
+    fn message_kind_marks_error_variants() {
+        assert!(MessageKind::Error.is_error());
+        assert!(MessageKind::EchoError.is_error());
+        assert!(MessageKind::LuaError.is_error());
+        assert!(MessageKind::RpcError.is_error());
+
+        assert!(!MessageKind::Echo.is_error());
+        assert!(!MessageKind::EchoMessage.is_error());
+        assert!(!MessageKind::Warning.is_error());
+    }
+
+    #[test]
+    fn message_kind_preserves_severity_highlights() {
+        assert_eq!(MessageKind::Error.highlight_group(), Some("ErrorMsg"));
+        assert_eq!(MessageKind::EchoError.highlight_group(), Some("ErrorMsg"));
+        assert_eq!(MessageKind::Warning.highlight_group(), Some("WarningMsg"));
+        assert_eq!(MessageKind::Echo.highlight_group(), None);
+    }
+
+    #[test]
+    fn msg_show_defaults_append_to_false_for_older_payloads() {
+        let event =
+            parse_msg_show(vec![Value::from("echo"), Value::Array(vec![]), Value::from(false)])
+                .unwrap();
+
+        match event {
+            RedrawEvent::MessageShow { append, .. } => assert!(!append),
+            event => panic!("expected MessageShow, got {event:?}"),
+        }
+    }
+
+    #[test]
+    fn msg_show_parses_append_from_newer_payloads() {
+        let event = parse_msg_show(vec![
+            Value::from("echo"),
+            Value::Array(vec![]),
+            Value::from(false),
+            Value::from(true),
+            Value::from(true),
+            Value::Nil,
+            Value::from(""),
+        ])
+        .unwrap();
+
+        match event {
+            RedrawEvent::MessageShow { append, .. } => assert!(append),
+            event => panic!("expected MessageShow, got {event:?}"),
+        }
+    }
 }

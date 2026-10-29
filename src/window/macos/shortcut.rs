@@ -1,52 +1,12 @@
 use log::warn;
 use objc2::rc::Retained;
+use objc2_app_kit::NSEvent;
 use objc2_app_kit::NSEventModifierFlags;
 use objc2_foundation::NSString;
-use winit::{
-    event::{ElementState, KeyEvent, Modifiers},
-    keyboard::{Key, NamedKey},
-};
-
-use crate::{CmdLineSettings, settings::Settings};
-
-#[derive(Clone, Copy)]
-pub enum TabNavigationAction {
-    Next,
-    Previous,
-}
-
-#[derive(Clone)]
-pub struct TabNavigationHotkeys {
-    next: Option<KeyCombo>,
-    prev: Option<KeyCombo>,
-}
-
-impl TabNavigationHotkeys {
-    pub fn new(settings: &Settings) -> Self {
-        let cmdline = settings.get::<CmdLineSettings>();
-        Self {
-            next: KeyCombo::parse(&cmdline.system_tab_next_hotkey),
-            prev: KeyCombo::parse(&cmdline.system_tab_prev_hotkey),
-        }
-    }
-
-    pub fn action_for(
-        &self,
-        event: &KeyEvent,
-        modifiers: &Modifiers,
-    ) -> Option<TabNavigationAction> {
-        match event.state {
-            ElementState::Pressed => [
-                (TabNavigationAction::Next, self.next.as_ref()),
-                (TabNavigationAction::Previous, self.prev.as_ref()),
-            ]
-            .into_iter()
-            .find(|(_, combo)| combo.is_some_and(|combo| combo.matches(event, modifiers)))
-            .map(|(action, _)| action),
-            ElementState::Released => None,
-        }
-    }
-}
+use winit::event::KeyEvent;
+use winit::event::Modifiers;
+use winit::keyboard::Key;
+use winit::keyboard::NamedKey;
 
 #[derive(Debug, Clone, Copy)]
 pub struct KeyCombo {
@@ -125,10 +85,38 @@ impl KeyCombo {
         }
     }
 
+    pub fn matches_key_event(&self, event: &KeyEvent, modifiers: &Modifiers) -> bool {
+        self.matches(event, modifiers)
+    }
+
+    pub fn matches_nsevent(&self, event: &NSEvent) -> bool {
+        if !self.nsevent_modifiers_match(event.modifierFlags()) {
+            return false;
+        }
+
+        match self.key {
+            KeyMatch::Char(expected) => event
+                .charactersIgnoringModifiers()
+                .and_then(|characters| characters.to_string().chars().next())
+                .is_some_and(|pressed| expected.eq_ignore_ascii_case(&pressed)),
+            KeyMatch::Named(_) => false,
+        }
+    }
+
     fn modifiers_match(&self, modifiers: &Modifiers) -> bool {
         let state = modifiers.state();
         (self.command, self.control, self.option, self.shift)
             == (state.super_key(), state.control_key(), state.alt_key(), state.shift_key())
+    }
+
+    fn nsevent_modifiers_match(&self, flags: NSEventModifierFlags) -> bool {
+        (self.command, self.control, self.option, self.shift)
+            == (
+                flags.contains(NSEventModifierFlags::Command),
+                flags.contains(NSEventModifierFlags::Control),
+                flags.contains(NSEventModifierFlags::Option),
+                flags.contains(NSEventModifierFlags::Shift),
+            )
     }
 }
 
@@ -225,9 +213,7 @@ impl ParseState {
     }
 }
 
-fn is_disabled_keyword(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case("false")
-}
+fn is_disabled_keyword(value: &str) -> bool { value.trim().eq_ignore_ascii_case("false") }
 
 #[derive(Debug, Clone, Copy)]
 enum KeyMatch {

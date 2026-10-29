@@ -1,21 +1,23 @@
-use std::{
-    collections::HashSet,
-    fmt::{Display, Formatter},
-    num::NonZeroUsize,
-    rc::Rc,
-};
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::fmt::Formatter;
+use std::num::NonZeroUsize;
+use std::rc::Rc;
 
 use log::trace;
 use lru::LruCache;
-use skia_safe::{Data, Font, FontHinting as SkiaHinting, FontMgr, font::Edging as SkiaEdging};
+use skia_safe::Data;
+use skia_safe::Font;
+use skia_safe::FontHinting as SkiaHinting;
+use skia_safe::FontMgr;
+use skia_safe::font::Edging as SkiaEdging;
 
-use crate::{
-    profiling::tracy_zone,
-    renderer::fonts::{
-        font_options::{CoarseStyle, FontDescription, FontEdging, FontHinting},
-        swash_font::SwashFont,
-    },
-};
+use crate::profiling::tracy_zone;
+use crate::renderer::fonts::font_options::CoarseStyle;
+use crate::renderer::fonts::font_options::FontDescription;
+use crate::renderer::fonts::font_options::FontEdging;
+use crate::renderer::fonts::font_options::FontHinting;
+use crate::renderer::fonts::swash_font::SwashFont;
 
 static DEFAULT_FONT: &[u8] = include_bytes!("../../../assets/fonts/FiraCodeNerdFont-Regular.ttf");
 static LAST_RESORT_FONT: &[u8] = include_bytes!("../../../assets/fonts/LastResort-Regular.ttf");
@@ -34,10 +36,10 @@ impl FontPair {
         skia_font.set_edging(font_edging(&key.edging));
 
         let typeface = skia_font.typeface();
-        let (font_data, index) = typeface.to_font_data()?;
+        let (font_data, index) = typeface.to_font_bytes()?;
         // Only the lower 16 bits are part of the index, the rest indicates named instances. But we
         // don't care about those here, since we are just loading the font, so ignore them
-        let index = index & 0xFFFF;
+        let index = (index & 0xFFFF) as usize;
         let swash_font = SwashFont::from_data(font_data, index)?;
 
         Some(Self { key, skia_font, swash_font })
@@ -45,9 +47,7 @@ impl FontPair {
 }
 
 impl PartialEq for FontPair {
-    fn eq(&self, other: &Self) -> bool {
-        self.swash_font.key == other.swash_font.key
-    }
+    fn eq(&self, other: &Self) -> bool { self.swash_font.key == other.swash_font.key }
 }
 
 #[derive(Debug, Default, Hash, PartialEq, Eq, Clone)]
@@ -97,7 +97,7 @@ impl FontLoader {
             FontPair::new(font_key, Font::from_typeface(typeface, self.font_size))
         } else {
             let data = Data::new_copy(DEFAULT_FONT);
-            let typeface = self.font_mgr.new_from_data(&data, 0)?;
+            let typeface = self.font_mgr.new_from_data(data, 0)?;
             FontPair::new(font_key, Font::from_typeface(typeface, self.font_size))
         }
     }
@@ -161,7 +161,7 @@ impl FontLoader {
             let font_key = FontKey::default();
             let data = Data::new_copy(LAST_RESORT_FONT);
 
-            let typeface = self.font_mgr.new_from_data(&data, 0)?;
+            let typeface = self.font_mgr.new_from_data(data, 0)?;
             let font_pair =
                 Rc::new(FontPair::new(font_key, Font::from_typeface(typeface, self.font_size))?);
 
@@ -174,13 +174,9 @@ impl FontLoader {
         self.cache.iter().map(|(_, v)| v.clone()).collect()
     }
 
-    pub fn refresh(&mut self, font_pair: &FontPair) {
-        self.cache.get(&font_pair.key);
-    }
+    pub fn refresh(&mut self, font_pair: &FontPair) { self.cache.get(&font_pair.key); }
 
-    pub fn font_names(&self) -> Vec<String> {
-        self.font_mgr.family_names().collect()
-    }
+    pub fn font_names(&self) -> Vec<String> { self.font_mgr.family_names().collect() }
 }
 
 fn font_hinting(hinting: &FontHinting) -> SkiaHinting {
@@ -221,5 +217,32 @@ mod tests {
 
         assert!(loader.get_or_load(&missing_font).is_none());
         assert_eq!(loader.failed_fonts.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn renders_colrv1_glyphs() {
+        use skia_safe::Color;
+        use skia_safe::Paint;
+        use skia_safe::Point;
+        use skia_safe::surfaces;
+
+        let data = Data::new_copy(font_test_data::COLRV0V1);
+        let typeface = FontMgr::new().new_from_data(data, 0).unwrap();
+        let font = Font::from_typeface(typeface, 96.0);
+        let mut surface = surfaces::raster_n32_premul((128, 128)).unwrap();
+        let canvas = surface.canvas();
+        canvas.clear(Color::TRANSPARENT);
+        canvas.draw_str("\u{f0100}", Point::new(8.0, 96.0), &font, &Paint::default());
+
+        let pixmap = surface.peek_pixels().unwrap();
+        let has_colored_pixel = (0..pixmap.height()).any(|y| {
+            (0..pixmap.width()).any(|x| {
+                let color = pixmap.get_color((x, y));
+                color.a() > 0 && (color.r() > 0 || color.g() > 0 || color.b() > 0)
+            })
+        });
+
+        assert!(has_colored_pixel, "Skia did not render the COLRv1 glyph in color");
     }
 }

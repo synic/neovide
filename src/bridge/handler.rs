@@ -1,34 +1,56 @@
-use std::fmt;
-use std::sync::{
-    Arc, Mutex, RwLock,
-    atomic::{AtomicBool, Ordering},
-};
+//! Handles RPC requests and redraw notifications from one neovim route. The
+//! editor creates this handler once for the route. Session setup replaces its
+//! current RPC handle on each attachment. Redraw transitions go to the window
+//! event loop, while ordinary redraws go to the editor thread.
 
-use async_trait::async_trait;
-use log::{trace, warn};
-use nvim_rs::{Handler, Neovim, call_args};
+use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use log::trace;
+use log::warn;
+use nvim_rs::Handler;
+use nvim_rs::Neovim;
+use nvim_rs::call_args;
 use rmpv::Value;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
 use winit::event_loop::EventLoopProxy;
 
+use super::ui_commands::UiCommand;
+use crate::LoggingReceiver;
+use crate::LoggingSender;
+use crate::bridge::GuiOption;
+use crate::bridge::NeovimWriter;
+use crate::bridge::ParallelCommand;
+use crate::bridge::RedrawEvent;
+use crate::bridge::SessionTransition;
+use crate::bridge::clipboard::get_clipboard_contents;
+use crate::bridge::clipboard::set_clipboard_contents;
+use crate::bridge::events::parse_redraw_event;
+use crate::bridge::parse_progress_bar_event;
+use crate::bridge::send_ui;
+use crate::clipboard::ClipboardHandle;
+use crate::errors::ResultPanicExplanation;
+use crate::running_tracker::RunningTracker;
+use crate::settings::FontConfigState;
+use crate::settings::Settings;
+use crate::window::EventPayload;
 #[cfg(target_os = "macos")]
 use crate::window::ForceClickKind;
-use crate::{
-    LoggingReceiver, LoggingSender,
-    bridge::{
-        GuiOption, NeovimWriter, ParallelCommand, RedrawEvent,
-        clipboard::{get_clipboard_contents, set_clipboard_contents},
-        events::parse_redraw_event,
-        parse_progress_bar_event, send_ui,
-    },
-    clipboard::ClipboardHandle,
-    error_handling::ResultPanicExplanation,
-    running_tracker::RunningTracker,
-    settings::{FontConfigState, Settings},
-    window::{EventPayload, RouteId, UserEvent, WindowCommand},
-};
+use crate::window::RouteId;
+use crate::window::UserEvent;
+use crate::window::WindowCommand;
 
-use super::ui_commands::UiCommand;
+/// Recognize a cleared `v:exitreason` after a restart announcement. The lua
+/// probe returns nil when neovim clears the value after a failed quit. Treat
+/// an empty string as cleared too. A nonempty reason leaves the request pending.
+fn restart_was_aborted(value: &Value) -> bool { value.is_nil() || value.as_str() == Some("") }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ClipboardRequestError {
@@ -50,9 +72,7 @@ impl fmt::Display for ClipboardRequestError {
 }
 
 impl From<ClipboardRequestError> for Value {
-    fn from(error: ClipboardRequestError) -> Self {
-        Value::from(error.to_string())
-    }
+    fn from(error: ClipboardRequestError) -> Self { Value::from(error.to_string()) }
 }
 
 fn handle_clipboard_request<T, F>(
@@ -69,12 +89,51 @@ where
     request(&mut clipboard)
 }
 
+fn handle_quit_request(
+    running_tracker: &RunningTracker,
+    arguments: &[Value],
+) -> Result<Value, Value> {
+    match arguments {
+        [Value::Nil] => Ok(Value::Nil),
+        [value] => {
+            let exit_code = value
+                .as_i64()
+                .ok_or_else(|| Value::from("neovide.quit expects an integer exit code or nil"))?;
+
+            running_tracker.quit_with_code(exit_code as u8, "Quit from neovim");
+
+            Ok(Value::Nil)
+        }
+        _ => Err(Value::from("neovide.quit expects an argument")),
+    }
+}
+
+/// Session data shared by every clone of the RPC handler for one route. `nvim`
+/// is empty before the first handle is installed. Session setup replaces it and
+/// updates the IME capability on later connections. Session exit does not clear
+/// it. A present handle identifies the last installed connection, not
+/// necessarily a live channel.
 #[derive(Default)]
 struct NeovimState {
     nvim: Option<Neovim<NeovimWriter>>,
+    /// The address recorded during setup of the last session. An explicit
+    /// server address is used as given. An embedded session queries
+    /// `v:servername`. An embedded WSL session or a missing answer leaves this
+    /// empty. Setup replaces the value on each new connection. It remains after
+    /// the old channel closes as a recovery hint for `:connect`, not a
+    /// reachability check.
+    server_address: Option<String>,
     can_support_ime_api: bool,
+    /// Captured before `nvim_ui_attach` when startup messages are externalized.
+    /// `flush_startup_messages` uses it to restore `cmdheight` after the first
+    /// rendered batch. Later session setup overwrites it when capture is
+    /// enabled.
+    pre_attach_cmdheight: Option<Value>,
 }
 
+/// RPC handler shared by the editor thread, UI command tasks, and one route.
+/// `start_editor_handler` creates it once per route. Clones share the current
+/// neovim handle, which session setup replaces when that route reconnects.
 #[derive(Clone)]
 pub struct NeovimHandler {
     // The EventLoopProxy is not sync on all platforms, so wrap it in a mutex
@@ -128,6 +187,49 @@ impl NeovimHandler {
         let _ = self.proxy.lock().unwrap().send_event(payload);
     }
 
+    /// Give each request an ID so a late restart probe cannot cancel a newer
+    /// request on the same route.
+    fn send_transition(&self, transition: SessionTransition) -> u64 {
+        static NEXT_TRANSITION_ID: AtomicU64 = AtomicU64::new(1);
+        let request_id = NEXT_TRANSITION_ID.fetch_add(1, Ordering::Relaxed);
+        let payload = EventPayload::for_route(
+            UserEvent::NeovimTransition { request_id, transition },
+            self.route_id,
+        );
+        let _ = self.proxy.lock().unwrap().send_event(payload);
+        request_id
+    }
+
+    /// Look for evidence that an announced restart failed to quit the old
+    /// server. Neovim sends `restart` before trying to quit, then clears
+    /// `v:exitreason` if it stays alive. lua returns nil for the cleared value,
+    /// whereas `nvim_get_vvar` reports a missing key. The protocol has no abort
+    /// event, so a probe that cannot get a response leaves the request pending.
+    /// A rapid later disconnect can reach the exit handler before the abort is
+    /// observed.
+    fn watch_restart_abort(&self, nvim: Neovim<NeovimWriter>, request_id: u64) {
+        let proxy = self.proxy.clone();
+        let route_id = self.route_id;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                match nvim.exec_lua("return vim.v.exitreason", vec![]).await {
+                    Ok(value) if restart_was_aborted(&value) => {
+                        let event = EventPayload::for_route(
+                            UserEvent::NeovimRestartAborted { request_id },
+                            route_id,
+                        );
+                        let _ = proxy.lock().unwrap().send_event(event);
+                        break;
+                    }
+                    Ok(_) => {}
+                    // No response means the abort was not confirmed.
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     pub fn get_ui_command_channel(&self) -> (LoggingSender<UiCommand>, LoggingReceiver<UiCommand>) {
         (self.ui_command_sender.clone(), self.ui_command_receiver.clone())
     }
@@ -137,6 +239,16 @@ impl NeovimHandler {
             guard.nvim = Some(neovim);
             guard.can_support_ime_api = can_support_ime_api;
         }
+    }
+
+    pub fn update_server_address(&self, address: Option<String>) {
+        if let Ok(mut guard) = self.current_neovim.write() {
+            guard.server_address = address;
+        }
+    }
+
+    pub fn server_address(&self) -> Option<String> {
+        self.current_neovim.read().ok().and_then(|guard| guard.server_address.clone())
     }
 
     pub fn clone_current_neovim(&self) -> Option<Neovim<NeovimWriter>> {
@@ -152,9 +264,22 @@ impl NeovimHandler {
     pub fn mark_ui_command_started(&self) -> bool {
         self.ui_command_started.swap(true, Ordering::SeqCst)
     }
+
+    pub fn set_pre_attach_cmdheight(&self, cmdheight: Value) {
+        if let Ok(mut guard) = self.current_neovim.write() {
+            guard.pre_attach_cmdheight = Some(cmdheight);
+        }
+    }
+
+    pub fn pre_attach_cmdheight(&self) -> Option<Value> {
+        self.current_neovim.read().ok().and_then(|guard| guard.pre_attach_cmdheight.clone())
+    }
+
+    pub fn send_redraw_event(&self, event: RedrawEvent) {
+        let _ = self.redraw_event_sender.send(event);
+    }
 }
 
-#[async_trait]
 impl Handler for NeovimHandler {
     type Writer = NeovimWriter;
 
@@ -164,7 +289,7 @@ impl Handler for NeovimHandler {
         arguments: Vec<Value>,
         _neovim: Neovim<Self::Writer>,
     ) -> Result<Value, Value> {
-        trace!("Neovim request: {:?}", &event_name);
+        trace!("Neovim request: {:?}", event_name);
 
         match event_name.as_ref() {
             "neovide.get_clipboard" => handle_clipboard_request(&self.clipboard, |clipboard| {
@@ -177,12 +302,7 @@ impl Handler for NeovimHandler {
                     .map_err(|_| ClipboardRequestError::CannotSetContents)
             })
             .map_err(Value::from),
-            "neovide.quit" => {
-                let error_code =
-                    arguments[0].as_i64().expect("Could not parse error code from neovim");
-                self.running_tracker.quit_with_code(error_code as u8, "Quit from neovim");
-                Ok(Value::Nil)
-            }
+            "neovide.quit" => handle_quit_request(&self.running_tracker, &arguments),
             _ => Ok(Value::from("rpcrequest not handled")),
         }
     }
@@ -193,7 +313,7 @@ impl Handler for NeovimHandler {
         arguments: Vec<Value>,
         neovim: Neovim<Self::Writer>,
     ) {
-        trace!("Neovim notification: {:?}", &event_name);
+        trace!("Neovim notification: {:?}", event_name);
 
         match event_name.as_ref() {
             "redraw" => {
@@ -208,11 +328,14 @@ impl Handler for NeovimHandler {
 
                         match parsed_event {
                             RedrawEvent::Restart { details } => {
-                                let payload = EventPayload::for_route(
-                                    UserEvent::NeovimRestart(details),
-                                    self.route_id,
-                                );
-                                let _ = self.proxy.lock().unwrap().send_event(payload);
+                                let id = self.send_transition(SessionTransition::Restart(details));
+                                self.watch_restart_abort(neovim.clone(), id);
+                            }
+                            RedrawEvent::Connect { address } => {
+                                self.send_transition(SessionTransition::Connect {
+                                    address,
+                                    previous_address: self.server_address(),
+                                });
                             }
                             _ => {
                                 let _ = self.redraw_event_sender.send(parsed_event);
@@ -256,6 +379,15 @@ impl Handler for NeovimHandler {
                 }
                 None => {
                     warn!("neovide.document_state called with invalid arguments: {arguments:?}")
+                }
+            },
+            #[cfg(target_os = "macos")]
+            "neovide.scrollbar_window" => match parse_scrollbar_window_args(&arguments) {
+                Some((window, metadata)) => {
+                    self.send_redraw_event(RedrawEvent::ScrollbarWindow { window, metadata });
+                }
+                None => {
+                    warn!("neovide.scrollbar_window called with invalid arguments: {arguments:?}")
                 }
             },
             #[cfg(target_os = "macos")]
@@ -339,6 +471,24 @@ fn parse_document_state_args(arguments: &[Value]) -> Option<(String, bool)> {
     Some((path.as_str().unwrap_or("").to_string(), modified.as_bool().unwrap_or(false)))
 }
 
+#[cfg(target_os = "macos")]
+fn parse_scrollbar_window_args(
+    arguments: &[Value],
+) -> Option<(u64, Option<crate::bridge::ScrollbarWindowMetadata>)> {
+    use crate::bridge::ScrollbarWindowMetadata;
+
+    let window = arguments.first()?.as_u64().filter(|id| *id > 0)?;
+    let metadata = match arguments {
+        [_] => None,
+        [_, buffer, eligible] => Some(ScrollbarWindowMetadata {
+            buffer: buffer.as_u64().filter(|id| *id > 0)?,
+            eligible: eligible.as_bool()?,
+        }),
+        _ => return None,
+    };
+    Some((window, metadata))
+}
+
 async fn skip_default_guifont(
     event: &RedrawEvent,
     settings: &Settings,
@@ -370,13 +520,20 @@ fn is_guifont_option_set(event: &RedrawEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        panic::{AssertUnwindSafe, catch_unwind},
-        sync::{Arc, Mutex},
-    };
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
-    use super::{ClipboardRequestError, handle_clipboard_request};
-    use crate::clipboard::{Clipboard, ClipboardError, ClipboardHandle, ProviderState};
+    use rmpv::Value;
+
+    use super::ClipboardRequestError;
+    use super::handle_clipboard_request;
+    use super::restart_was_aborted;
+    use crate::clipboard::Clipboard;
+    use crate::clipboard::ClipboardError;
+    use crate::clipboard::ClipboardHandle;
+    use crate::clipboard::ProviderState;
 
     fn unavailable_clipboard(error: ClipboardError) -> Arc<Mutex<Clipboard>> {
         Arc::new(Mutex::new(Clipboard::from_provider_states_for_test(
@@ -384,6 +541,14 @@ mod tests {
             #[cfg(target_os = "linux")]
             ProviderState::unavailable_for_test(error),
         )))
+    }
+
+    #[test]
+    fn restart_probe_only_cancels_after_exitreason_clears() {
+        assert!(!restart_was_aborted(&Value::from("restart")));
+        assert!(!restart_was_aborted(&Value::from("restart!")));
+        assert!(restart_was_aborted(&Value::from("")));
+        assert!(restart_was_aborted(&Value::Nil));
     }
 
     #[test]

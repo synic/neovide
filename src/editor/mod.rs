@@ -2,41 +2,97 @@ mod cursor;
 mod draw_command_batcher;
 mod grid;
 mod intro;
+#[cfg(target_os = "macos")]
+mod scrollbar;
 mod style;
 mod window;
 
-use std::{collections::HashMap, sync::Arc, thread};
-
+use std::collections::HashMap;
 #[cfg(target_os = "macos")]
-use {
-    std::collections::HashSet,
-    std::time::{Duration, Instant},
-};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::thread;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 
-use log::{error, trace, warn};
+pub use cursor::Cursor;
+pub use cursor::CursorMode;
+pub use cursor::CursorShape;
+pub use draw_command_batcher::DrawCommandBatcher;
+use intro::IntroMessageExtender;
+use intro::IntroProcessing;
+use log::error;
+use log::trace;
+use log::warn;
+#[cfg(target_os = "macos")]
+pub use scrollbar::ScrollbarGrid;
+#[cfg(target_os = "macos")]
+pub use scrollbar::ScrollbarSnapshot;
+#[cfg(target_os = "macos")]
+use scrollbar::retain_tiled_focus;
+#[cfg(target_os = "macos")]
+use scrollbar::update_window_metadata;
 use skia_safe::Color4f;
+pub use style::Colors;
+pub use style::Style;
+pub use style::UnderlineStyle;
 use tokio::sync::mpsc::unbounded_channel;
+pub use window::*;
 use winit::event_loop::EventLoopProxy;
 use winit::window::Theme;
 
-use crate::{
-    bridge::{EditorMode, GridLineCell, GuiOption, NeovimHandler, RedrawEvent, WindowAnchor},
-    clipboard::ClipboardHandle,
-    profiling::{tracy_named_frame, tracy_zone},
-    renderer::{DrawCommand, WindowDrawCommand, rendered_window::BASE_GRID_ID},
-    running_tracker::RunningTracker,
-    settings::Settings,
-    units::{GridRect, GridSize},
-    window::{EventPayload, RouteId, UserEvent, WindowCommand, WindowSettings},
-};
-
-pub use cursor::{Cursor, CursorMode, CursorShape};
-pub use draw_command_batcher::DrawCommandBatcher;
-pub use style::{Colors, Style, UnderlineStyle};
-pub use window::*;
-
-use intro::{IntroMessageExtender, IntroProcessing};
+use crate::bridge::EditorMode;
+use crate::bridge::GridLineCell;
+use crate::bridge::GuiOption;
+use crate::bridge::MessageKind;
+use crate::bridge::NeovimHandler;
+use crate::bridge::RedrawEvent;
+#[cfg(target_os = "macos")]
+use crate::bridge::ScrollbarWindowMetadata;
+use crate::bridge::StartupMessage;
+use crate::bridge::StyledContent;
+use crate::bridge::WindowAnchor;
+use crate::clipboard::ClipboardHandle;
+use crate::profiling::tracy_named_frame;
+use crate::profiling::tracy_zone;
+use crate::renderer::DrawCommand;
+use crate::renderer::WindowDrawCommand;
+use crate::renderer::rendered_window::BASE_GRID_ID;
+use crate::running_tracker::RunningTracker;
+use crate::settings::Settings;
+use crate::units::GridRect;
+use crate::units::GridSize;
+use crate::window::EventPayload;
+use crate::window::RouteId;
+use crate::window::UserEvent;
+use crate::window::WindowCommand;
+use crate::window::WindowSettings;
 pub const MSG_ZINDEX: u64 = 200; // See the documenation for nvim_open_win
+
+fn styled_content_to_plain_text(content: StyledContent) -> String {
+    content.into_iter().map(|(_, text)| text).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupMessageCapture {
+    BeforeFirstGrid,
+    UntilFirstFlush(StartupFlushReason),
+    RestoringMessageUi,
+    MessageUiRestored,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupFlushReason {
+    Prompt,
+    FirstGrid,
+}
+
+impl StartupMessageCapture {
+    fn is_active(self) -> bool { self != Self::Finished }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SortOrder {
@@ -57,9 +113,7 @@ impl Ord for SortOrder {
 }
 
 impl PartialOrd for SortOrder {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,6 +170,7 @@ pub struct Editor {
     pub current_mode_index: Option<u64>,
     current_mode: EditorMode,
     pub ui_ready: bool,
+    startup_message_capture: StartupMessageCapture,
     event_loop_proxy: EventLoopProxy<EventPayload>,
     route_id: RouteId,
     #[allow(dead_code)]
@@ -132,6 +187,10 @@ pub struct Editor {
     match_paren_dirty: bool,
     #[cfg(target_os = "macos")]
     match_paren_cache_cleared_in_batch: bool,
+    #[cfg(target_os = "macos")]
+    active_editor_grid: Option<u64>,
+    #[cfg(target_os = "macos")]
+    scrollbar_windows: HashMap<u64, ScrollbarWindowMetadata>,
 }
 
 impl Editor {
@@ -154,11 +213,16 @@ impl Editor {
             match_paren_dirty: false,
             #[cfg(target_os = "macos")]
             match_paren_cache_cleared_in_batch: false,
+            #[cfg(target_os = "macos")]
+            active_editor_grid: None,
+            #[cfg(target_os = "macos")]
+            scrollbar_windows: HashMap::new(),
             mode_list: Vec::new(),
             draw_command_batcher: DrawCommandBatcher::new(),
             current_mode_index: None,
             current_mode: EditorMode::Normal,
             ui_ready: false,
+            startup_message_capture: StartupMessageCapture::Finished,
             settings,
             event_loop_proxy,
             route_id,
@@ -170,6 +234,24 @@ impl Editor {
     fn send_window_command(&self, command: WindowCommand) {
         let payload = EventPayload::for_route(UserEvent::WindowCommand(command), self.route_id);
         let _ = self.event_loop_proxy.send_event(payload);
+    }
+
+    fn send_draw_batch(&self, batch: Vec<DrawCommand>) {
+        let payload = EventPayload::for_route(batch.into(), self.route_id);
+        let _ = self.event_loop_proxy.send_event(payload);
+    }
+
+    fn update_window_viewport(&mut self, grid: u64, viewport: WindowViewport) {
+        if let Some(window_state) = self.windows.get_mut(&grid) {
+            window_state.set_viewport(viewport);
+        }
+    }
+
+    fn update_window_viewport_margins(&mut self, grid: u64, top: u64, bottom: u64) {
+        let Some(window_state) = self.windows.get_mut(&grid) else {
+            return;
+        };
+        window_state.set_viewport_margins(top, bottom);
     }
 
     pub fn handle_redraw_event(&mut self, event: RedrawEvent) {
@@ -228,10 +310,26 @@ impl Editor {
                 trace!("Image flushed");
                 tracy_named_frame!("neovim draw command flush");
                 self.send_cursor_info();
+                self.advance_startup_capture_on_flush();
 
+                #[cfg(target_os = "macos")]
                 {
-                    trace!("send_batch");
-                    self.draw_command_batcher.send_batch(self.route_id, &self.event_loop_proxy);
+                    self.active_editor_grid = retain_tiled_focus(
+                        &self.windows,
+                        self.cursor.parent_window_id,
+                        self.active_editor_grid,
+                    );
+                    self.draw_command_batcher.queue(DrawCommand::ScrollbarSnapshot(
+                        ScrollbarSnapshot::capture(
+                            &self.windows,
+                            self.active_editor_grid,
+                            &self.scrollbar_windows,
+                        ),
+                    ));
+                }
+
+                if let Some(batch) = self.draw_command_batcher.finish_batch() {
+                    self.send_draw_batch(batch);
                 }
 
                 #[cfg(target_os = "macos")]
@@ -247,11 +345,9 @@ impl Editor {
                 self.send_window_command(WindowCommand::ThemeChanged(window_theme_for_background(
                     colors.background,
                 )));
-
                 self.draw_command_batcher
                     .queue(DrawCommand::DefaultStyleChanged(Style::new(colors)));
                 self.redraw_screen();
-                self.draw_command_batcher.send_batch(self.route_id, &self.event_loop_proxy);
             }
             RedrawEvent::HighlightAttributesDefine { id, style, name } => {
                 tracy_zone!("EditorHighlightAttributesDefine");
@@ -337,9 +433,25 @@ impl Editor {
                     );
                 }
             }
-            RedrawEvent::WindowPosition { grid, start_row, start_column, width, height } => {
+            RedrawEvent::WindowPosition {
+                grid,
+                window,
+                start_row,
+                start_column,
+                width,
+                height,
+            } => {
                 tracy_zone!("EditorWindowPosition");
-                self.set_window_position(grid, start_column, start_row, width, height)
+                self.set_window_position(
+                    grid,
+                    TiledWindowLayout {
+                        window,
+                        rect: GridRect::from_origin_and_size(
+                            (start_column, start_row).into(),
+                            (width, height).into(),
+                        ),
+                    },
+                );
             }
             RedrawEvent::WindowFloatPosition {
                 grid,
@@ -391,21 +503,56 @@ impl Editor {
                 tracy_zone!("EditorMessageSetPosition");
                 self.set_message_position(grid, row, scrolled, z_index, comp_index)
             }
+            RedrawEvent::MessageShow { kind, content, replace_last, append } => {
+                tracy_zone!("EditorMessageShow");
+                self.handle_startup_message(kind, content, replace_last, append);
+            }
+            RedrawEvent::CommandLineShow { .. } | RedrawEvent::CommandLineBlockShow { .. } => {
+                tracy_zone!("EditorCommandLineShow");
+                self.finish_startup_capture_on_prompt();
+            }
+            RedrawEvent::MessageClear => {
+                tracy_zone!("EditorMessageClear");
+                self.clear_startup_messages();
+            }
+            RedrawEvent::NeovimSessionStarted => {
+                tracy_zone!("EditorNeovimSessionStarted");
+                self.reset_startup_message_capture();
+            }
+            RedrawEvent::StartupMessageUiRestored => {
+                tracy_zone!("EditorStartupMessageUiRestored");
+                self.replay_startup_messages();
+                if self.startup_message_capture == StartupMessageCapture::RestoringMessageUi {
+                    self.startup_message_capture = StartupMessageCapture::MessageUiRestored;
+                }
+            }
             RedrawEvent::WindowViewport {
                 grid,
-                // Don't send viewport events if they don't have a scroll delta
-                scroll_delta: Some(scroll_delta),
+                window,
+                top_line,
+                bottom_line,
+                current_line,
+                line_count,
+                scroll_delta,
                 ..
             } => {
                 tracy_zone!("EditorWindowViewport");
                 self.set_ui_ready();
-                self.draw_command_batcher.queue(DrawCommand::Window {
-                    grid_id: grid,
-                    command: WindowDrawCommand::Viewport { scroll_delta },
-                });
+                if let Some(scroll_delta) = scroll_delta {
+                    self.draw_command_batcher.queue(DrawCommand::Window {
+                        grid_id: grid,
+                        command: WindowDrawCommand::Viewport { scroll_delta },
+                    });
+                }
+
+                self.update_window_viewport(
+                    grid,
+                    WindowViewport { window, top_line, bottom_line, current_line, line_count },
+                );
             }
             RedrawEvent::WindowViewportMargins { grid, top, bottom, left, right } => {
                 tracy_zone!("EditorWindowViewportMargins");
+                self.update_window_viewport_margins(grid, top, bottom);
                 self.draw_command_batcher.queue(DrawCommand::Window {
                     grid_id: grid,
                     command: WindowDrawCommand::ViewportMargins { top, bottom, left, right },
@@ -416,7 +563,18 @@ impl Editor {
                 self.send_window_command(WindowCommand::Minimize);
             }
             RedrawEvent::NeovideSetRedraw(enable) => {
-                self.draw_command_batcher.set_enabled(enable, self.route_id, &self.event_loop_proxy)
+                for batch in self.draw_command_batcher.set_enabled(enable) {
+                    self.send_draw_batch(batch);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            RedrawEvent::ScrollbarWindow { window, metadata } => {
+                update_window_metadata(
+                    &mut self.windows,
+                    &mut self.scrollbar_windows,
+                    window,
+                    metadata,
+                );
             }
             RedrawEvent::NeovideIntroBannerAllowed(allowed) => {
                 self.intro_message_extender.set_sponsor_allowed(
@@ -430,6 +588,12 @@ impl Editor {
     }
 
     fn close_window(&mut self, grid: u64) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.active_editor_grid == Some(grid) {
+                self.active_editor_grid = None;
+            }
+        }
         if let Some(window) = self.windows.remove(&grid) {
             window.close(&mut self.draw_command_batcher);
         }
@@ -444,7 +608,7 @@ impl Editor {
                 self.set_window_float_position(grid, anchor_info, None, None)
             }
         } else {
-            let window = Window::new(
+            let mut window = Window::new(
                 grid,
                 WindowType::Editor,
                 None,
@@ -462,31 +626,11 @@ impl Editor {
         }
     }
 
-    fn set_window_position(
-        &mut self,
-        grid: u64,
-        start_left: u64,
-        start_top: u64,
-        width: u64,
-        height: u64,
-    ) {
+    fn set_window_position(&mut self, grid: u64, layout: TiledWindowLayout) {
         if let Some(window) = self.windows.get_mut(&grid) {
-            window.position(
-                &mut self.draw_command_batcher,
-                None,
-                (width, height),
-                (start_left as f64, start_top as f64),
-            );
-            window.show(&mut self.draw_command_batcher);
+            window.position_tiled(&mut self.draw_command_batcher, layout);
         } else {
-            let new_window = Window::new(
-                grid,
-                WindowType::Editor,
-                None,
-                (start_left as f64, start_top as f64),
-                (width, height),
-                &mut self.draw_command_batcher,
-            );
+            let new_window = Window::new_tiled(grid, layout, &mut self.draw_command_batcher);
             self.windows.insert(grid, new_window);
         }
     }
@@ -671,6 +815,11 @@ impl Editor {
 
         self.cursor.parent_window_id = grid;
         self.cursor.grid_position = (grid_left, grid_top);
+
+        #[cfg(target_os = "macos")]
+        if self.windows.get(&grid).and_then(Window::visible_tiled_layout).is_some() {
+            self.active_editor_grid = Some(grid);
+        }
     }
 
     fn draw_grid_line(&mut self, grid: u64, row: u64, column_start: u64, cells: &[GridLineCell]) {
@@ -735,7 +884,7 @@ impl Editor {
     #[cfg(target_os = "macos")]
     fn grid_cell_text(&self, grid: u64, row: u64, column: u64) -> Option<String> {
         self.windows.get(&grid).and_then(|window| {
-            let (text, _, _) = window.get_cursor_grid_cell(column, row);
+            let (text, ..) = window.get_cursor_grid_cell(column, row);
             (!text.is_empty()).then_some(text)
         })
     }
@@ -1163,7 +1312,7 @@ impl Editor {
     }
 
     fn set_option(&mut self, gui_option: GuiOption) {
-        trace!("Option set {:?}", &gui_option);
+        trace!("Option set {:?}", gui_option);
 
         match gui_option {
             GuiOption::GuiFont(guifont) => {
@@ -1193,8 +1342,72 @@ impl Editor {
     fn set_ui_ready(&mut self) {
         if !self.ui_ready {
             self.ui_ready = true;
-            self.draw_command_batcher.queue(DrawCommand::UIReady);
+            self.startup_message_capture =
+                StartupMessageCapture::UntilFirstFlush(StartupFlushReason::FirstGrid);
         }
+    }
+
+    fn reset_startup_message_capture(&mut self) {
+        self.ui_ready = false;
+        self.startup_message_capture = StartupMessageCapture::BeforeFirstGrid;
+    }
+
+    fn handle_startup_message(
+        &mut self,
+        kind: MessageKind,
+        content: StyledContent,
+        replace_last: bool,
+        append: bool,
+    ) {
+        if !self.startup_message_capture.is_active() {
+            return;
+        }
+
+        if kind == MessageKind::ReturnPrompt {
+            self.finish_startup_capture_on_prompt();
+        }
+
+        let content = styled_content_to_plain_text(content);
+        if content.is_empty() {
+            return;
+        }
+
+        self.draw_command_batcher.queue(DrawCommand::StartupMessage {
+            message: StartupMessage { kind, content },
+            replace_last,
+            append,
+        });
+    }
+
+    fn clear_startup_messages(&mut self) {
+        if self.startup_message_capture.is_active() {
+            self.draw_command_batcher.queue(DrawCommand::ClearStartupMessages);
+        }
+    }
+
+    fn advance_startup_capture_on_flush(&mut self) {
+        if let StartupMessageCapture::UntilFirstFlush(reason) = self.startup_message_capture {
+            let command = match reason {
+                StartupFlushReason::Prompt => DrawCommand::StartupPrompt,
+                StartupFlushReason::FirstGrid => DrawCommand::UIReady,
+            };
+            self.draw_command_batcher.queue(command);
+            self.startup_message_capture = StartupMessageCapture::RestoringMessageUi;
+        } else if self.startup_message_capture == StartupMessageCapture::MessageUiRestored {
+            self.draw_command_batcher.queue(DrawCommand::ReplayStartupMessages);
+            self.startup_message_capture = StartupMessageCapture::Finished;
+        }
+    }
+
+    fn finish_startup_capture_on_prompt(&mut self) {
+        if self.startup_message_capture == StartupMessageCapture::BeforeFirstGrid {
+            self.startup_message_capture =
+                StartupMessageCapture::UntilFirstFlush(StartupFlushReason::Prompt);
+        }
+    }
+
+    fn replay_startup_messages(&self) {
+        self.send_draw_batch(vec![DrawCommand::ReplayStartupMessages]);
     }
 }
 

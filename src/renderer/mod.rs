@@ -16,60 +16,78 @@ pub mod d3d;
 #[cfg(target_os = "macos")]
 mod metal;
 
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, hash_map::Entry},
-    rc::Rc,
-    sync::Arc,
-};
-
-use itertools::Itertools;
-use progress_bar::{ProgressBar, ProgressBarSettings};
-use skia_safe::{Canvas, Color4f, Paint};
-
-use winit::{
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoopProxy},
-    window::{Window, WindowAttributes},
-};
-
-use crate::{
-    WindowSettings,
-    bridge::EditorMode,
-    cmd_line::CmdLineSettings,
-    editor::{Cursor, Style, WindowType},
-    profiling::{tracy_create_gpu_context, tracy_named_frame, tracy_zone},
-    renderer::{
-        fonts::font_options::PixelGeometry,
-        rendered_layer::{FloatingLayer, group_windows},
-    },
-    settings::*,
-    units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, to_skia_rect},
-    window::{EventPayload, ShouldRender},
-};
-
-#[cfg(feature = "profiling")]
-use crate::profiling::tracy_plot;
-#[cfg(feature = "profiling")]
-use skia_safe::graphics::{
-    font_cache_count_limit, font_cache_count_used, font_cache_limit, font_cache_used,
-    resource_cache_single_allocation_byte_limit, resource_cache_total_bytes_limit,
-    resource_cache_total_bytes_used,
-};
-
-#[cfg(feature = "gpu_profiling")]
-use crate::profiling::GpuCtx;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use cursor_renderer::CursorRenderer;
 pub use fonts::caching_shaper::CachingShaper;
 pub use grid_renderer::GridRenderer;
-pub use rendered_window::{RenderedWindow, WindowDrawCommand, WindowDrawDetails};
-
+use itertools::Itertools;
+use progress_bar::ProgressBar;
+use progress_bar::ProgressBarSettings;
+pub use rendered_window::RenderedWindow;
+pub use rendered_window::WindowDrawCommand;
+pub use rendered_window::WindowDrawDetails;
+use skia_safe::Canvas;
+use skia_safe::Color4f;
+use skia_safe::Paint;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::font_cache_count_limit;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::font_cache_count_used;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::font_cache_limit;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::font_cache_used;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::resource_cache_single_allocation_byte_limit;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::resource_cache_total_bytes_limit;
+#[cfg(feature = "profiling")]
+use skia_safe::graphics::resource_cache_total_bytes_used;
 pub use vsync::VSync;
+use winit::event::WindowEvent;
+use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::EventLoopProxy;
+use winit::window::Window;
+use winit::window::WindowAttributes;
 
 use self::fonts::font_options::FontOptions;
+use crate::WindowSettings;
+use crate::bridge::EditorMode;
+use crate::bridge::StartupMessage;
+use crate::cmd_line::CmdLineSettings;
+use crate::editor::Cursor;
+#[cfg(target_os = "macos")]
+use crate::editor::ScrollbarSnapshot;
+use crate::editor::Style;
+use crate::editor::WindowType;
+#[cfg(feature = "gpu_profiling")]
+use crate::profiling::GpuCtx;
+use crate::profiling::tracy_create_gpu_context;
+use crate::profiling::tracy_named_frame;
+#[cfg(feature = "profiling")]
+use crate::profiling::tracy_plot;
+use crate::profiling::tracy_zone;
+use crate::renderer::fonts::font_options::PixelGeometry;
+use crate::renderer::rendered_layer::FloatingLayer;
+use crate::renderer::rendered_layer::group_windows;
+use crate::settings::*;
+use crate::units::GridPos;
+use crate::units::GridRect;
+use crate::units::GridScale;
+use crate::units::GridSize;
+use crate::units::PixelPos;
+use crate::units::PixelRect;
+use crate::units::to_skia_rect;
+use crate::window::EventPayload;
+use crate::window::ShouldRender;
 
 const MESSAGE_SELECTION_ALPHA: f32 = 0.35;
+const STARTUP_MESSAGE_LIMIT: usize = 4;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct MessageSelection {
@@ -151,8 +169,27 @@ pub enum DrawCommand {
     LineSpaceChanged(f32),
     DefaultStyleChanged(Style),
     ModeChanged(EditorMode),
+    StartupMessage {
+        message: StartupMessage,
+        replace_last: bool,
+        append: bool,
+    },
+    ClearStartupMessages,
+    StartupPrompt,
+    ReplayStartupMessages,
     UIReady,
-    Window { grid_id: u64, command: WindowDrawCommand },
+    #[cfg(target_os = "macos")]
+    ScrollbarSnapshot(ScrollbarSnapshot),
+    Window {
+        grid_id: u64,
+        command: WindowDrawCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupMessageFlush {
+    RestoreMessageUi,
+    Replay,
 }
 
 pub struct Renderer {
@@ -164,6 +201,9 @@ pub struct Renderer {
 
     pub rendered_windows: HashMap<u64, RenderedWindow>,
     pub window_regions: Vec<WindowDrawDetails>,
+    /// committed with this route grids, including before its OS window exists.
+    #[cfg(target_os = "macos")]
+    pub scrollbar_snapshot: Option<ScrollbarSnapshot>,
 
     profiler: profiler::Profiler,
     pub os_scale_factor: f64,
@@ -171,12 +211,18 @@ pub struct Renderer {
 
     settings: Arc<Settings>,
     message_selection: Option<MessageSelection>,
+    startup_messages: Vec<StartupMessage>,
+    startup_message_ui_restored: bool,
 }
 
 /// Results of processing the draw commands from the command channel.
 pub struct DrawCommandResult {
+    #[cfg(target_os = "macos")]
+    pub scrollbar_changed: bool,
     pub font_changed: bool,
     pub should_show: bool,
+    pub startup_message_flush: Option<StartupMessageFlush>,
+    pub startup_messages: Vec<StartupMessage>,
 }
 
 impl Renderer {
@@ -203,6 +249,8 @@ impl Renderer {
 
         Renderer {
             rendered_windows,
+            #[cfg(target_os = "macos")]
+            scrollbar_snapshot: None,
             cursor_renderer,
             grid_renderer,
             current_mode,
@@ -213,6 +261,8 @@ impl Renderer {
             user_scale_factor,
             settings,
             message_selection: None,
+            startup_messages: Vec::new(),
+            startup_message_ui_restored: false,
         }
     }
 
@@ -220,24 +270,15 @@ impl Renderer {
         self.cursor_renderer.handle_event(event);
     }
 
-    pub fn font_names(&self) -> Vec<String> {
-        self.grid_renderer.font_names()
-    }
+    pub fn font_names(&self) -> Vec<String> { self.grid_renderer.font_names() }
 
     pub fn set_message_selection(&mut self, selection: Option<MessageSelection>) {
         self.message_selection = selection;
     }
 
-    pub fn prepare_frame(&mut self) -> ShouldRender {
-        self.cursor_renderer.prepare_frame()
-    }
+    pub fn prepare_frame(&mut self) -> ShouldRender { self.cursor_renderer.prepare_frame() }
 
-    pub fn draw_frame(
-        &mut self,
-        root_canvas: &Canvas,
-        content_region: Option<&PixelRect<f32>>,
-        dt: f32,
-    ) {
+    pub fn draw_frame(&mut self, root_canvas: &Canvas, content_region: &PixelRect<f32>, dt: f32) {
         tracy_zone!("renderer_draw_frame");
         let window_settings = self.settings.get::<WindowSettings>();
         let opacity = if window_settings.normal_opacity < 1.0 {
@@ -252,13 +293,7 @@ impl Renderer {
         root_canvas.clear(default_background);
         root_canvas.save();
         root_canvas.reset_matrix();
-
-        if let Some(content_region) = content_region {
-            root_canvas.clip_rect(to_skia_rect(content_region), None, Some(false));
-        } else if let Some(root_window) = self.rendered_windows.get(&1) {
-            let clip_rect = to_skia_rect(&root_window.pixel_region(grid_scale));
-            root_canvas.clip_rect(clip_rect, None, Some(false));
-        }
+        root_canvas.clip_rect(to_skia_rect(content_region), None, Some(false));
 
         let (root_windows, floating_layers) = {
             let (mut root_windows, mut floating_windows): (
@@ -332,17 +367,20 @@ impl Renderer {
 
         let settings = self.settings.get::<RendererSettings>();
         let max_root_x = max_window_max_x(&root_windows, grid_scale);
+        let max_root_y = max_window_max_y(&root_windows, grid_scale);
         let root_window_regions = root_windows
             .into_iter()
             .map(|window| {
                 let region = window.pixel_region(grid_scale);
                 let rightmost_root_window = is_rightmost_window_edge(region.max.x, max_root_x);
+                let bottommost_root_window = is_bottommost_window_edge(region.max.y, max_root_y);
                 window.draw(
                     root_canvas,
                     default_background,
                     grid_scale,
-                    content_region.copied(),
+                    Some(*content_region),
                     rightmost_root_window,
+                    bottommost_root_window,
                 )
             })
             .collect_vec();
@@ -355,7 +393,7 @@ impl Renderer {
                     &settings,
                     default_background,
                     grid_scale,
-                    content_region.copied(),
+                    Some(*content_region),
                 )
             })
             .collect_vec();
@@ -471,7 +509,7 @@ impl Renderer {
 
         let progress_bar_settings = self.settings.get::<ProgressBarSettings>();
         self.progress_bar.animate(&progress_bar_settings, dt);
-        animating |= self.progress_bar.is_animating();
+        animating |= self.progress_bar.is_active();
 
         animating
     }
@@ -500,12 +538,28 @@ impl Renderer {
 
     pub fn handle_draw_commands(&mut self, batch: Vec<DrawCommand>) -> DrawCommandResult {
         let settings = self.settings.get::<RendererSettings>();
-        let mut result = DrawCommandResult { font_changed: false, should_show: false };
+        let mut result = DrawCommandResult {
+            #[cfg(target_os = "macos")]
+            scrollbar_changed: false,
+            font_changed: false,
+            should_show: false,
+            startup_message_flush: None,
+            startup_messages: vec![],
+        };
 
         for draw_command in batch {
             self.handle_draw_command(draw_command, &mut result);
             tracy_named_frame!("neovim draw batch processed");
         }
+
+        if self.should_auto_replay_startup_messages(&result) {
+            result.startup_message_flush = Some(StartupMessageFlush::Replay);
+        }
+
+        if result.startup_message_flush.is_some() {
+            result.startup_messages = self.take_startup_messages();
+        }
+
         self.flush(&settings);
 
         result
@@ -571,6 +625,11 @@ impl Renderer {
             DrawCommand::UpdateCursor(new_cursor) => {
                 self.cursor_renderer.update_cursor(new_cursor);
             }
+            #[cfg(target_os = "macos")]
+            DrawCommand::ScrollbarSnapshot(snapshot) => {
+                self.scrollbar_snapshot = Some(snapshot);
+                result.scrollbar_changed = true;
+            }
             DrawCommand::FontChanged(new_font) => {
                 self.grid_renderer.update_font(&new_font);
                 result.font_changed = true;
@@ -585,10 +644,65 @@ impl Renderer {
             DrawCommand::ModeChanged(new_mode) => {
                 self.current_mode = new_mode;
             }
+            DrawCommand::StartupMessage { message, replace_last, append } => {
+                self.push_startup_message(message, replace_last, append);
+            }
+            DrawCommand::ClearStartupMessages => {
+                self.startup_messages.pop();
+            }
+            DrawCommand::StartupPrompt => {
+                result.should_show = true;
+                result.startup_message_flush = Some(StartupMessageFlush::RestoreMessageUi);
+            }
+            DrawCommand::ReplayStartupMessages => {
+                self.startup_message_ui_restored = true;
+                result.startup_message_flush = Some(StartupMessageFlush::Replay);
+            }
             DrawCommand::UIReady => {
                 result.should_show = true;
+                result.startup_message_flush = Some(StartupMessageFlush::RestoreMessageUi);
             }
         }
+    }
+
+    fn should_auto_replay_startup_messages(&self, result: &DrawCommandResult) -> bool {
+        self.startup_message_ui_restored
+            && result.startup_message_flush.is_none()
+            && !self.startup_messages.is_empty()
+    }
+
+    fn push_startup_message(&mut self, message: StartupMessage, replace_last: bool, append: bool) {
+        match (append, replace_last, self.startup_messages.last_mut()) {
+            (true, _, Some(last_message)) => last_message.content.push_str(&message.content),
+            (_, true, Some(last_message)) => *last_message = message,
+            _ => {
+                self.startup_messages.push(message);
+                self.trim_startup_messages();
+            }
+        }
+    }
+
+    fn trim_startup_messages(&mut self) {
+        let overflow = self.startup_messages.len().saturating_sub(STARTUP_MESSAGE_LIMIT);
+        if overflow > 0 {
+            self.startup_messages.drain(..overflow);
+        }
+    }
+
+    fn take_startup_messages(&mut self) -> Vec<StartupMessage> {
+        std::mem::take(&mut self.startup_messages)
+            .into_iter()
+            .flat_map(|message| {
+                let kind = message.kind;
+                message
+                    .content
+                    .lines()
+                    .map(str::trim_end)
+                    .filter(|line| !line.is_empty())
+                    .map(move |line| StartupMessage { kind, content: line.to_string() })
+                    .collect_vec()
+            })
+            .collect()
     }
 
     pub fn flush(&mut self, renderer_settings: &RendererSettings) {
@@ -597,16 +711,20 @@ impl Renderer {
 
     pub fn clear(&mut self) {
         self.rendered_windows.clear();
+        #[cfg(target_os = "macos")]
+        {
+            self.scrollbar_snapshot = None;
+        }
         self.window_regions.clear();
         self.cursor_renderer = CursorRenderer::new(self.settings.clone());
         self.progress_bar = ProgressBar::new();
         self.current_mode = EditorMode::Unknown(String::new());
         self.message_selection = None;
+        self.startup_messages.clear();
+        self.startup_message_ui_restored = false;
     }
 
-    pub fn get_cursor_destination(&self) -> PixelPos<f32> {
-        self.cursor_renderer.get_destination()
-    }
+    pub fn get_cursor_destination(&self) -> PixelPos<f32> { self.cursor_renderer.get_destination() }
 
     pub fn get_grid_size(&self) -> GridSize<u32> {
         if let Some(main_grid) = self.rendered_windows.get(&1) {
@@ -621,10 +739,21 @@ pub fn is_rightmost_window_edge(region_max_x: f32, max_x: f32) -> bool {
     max_x.is_finite() && (region_max_x - max_x).abs() <= f32::EPSILON
 }
 
+pub fn is_bottommost_window_edge(region_max_y: f32, max_y: f32) -> bool {
+    max_y.is_finite() && (region_max_y - max_y).abs() <= f32::EPSILON
+}
+
 pub fn max_window_max_x(windows: &[&mut RenderedWindow], grid_scale: GridScale) -> f32 {
     windows.iter().fold(f32::NEG_INFINITY, |max_x, window| {
         let region = window.pixel_region(grid_scale);
         max_x.max(region.max.x)
+    })
+}
+
+pub fn max_window_max_y(windows: &[&mut RenderedWindow], grid_scale: GridScale) -> f32 {
+    windows.iter().fold(f32::NEG_INFINITY, |max_y, window| {
+        let region = window.pixel_region(grid_scale);
+        max_y.max(region.max.y)
     })
 }
 
@@ -733,11 +862,17 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::bridge::MessageKind;
 
     fn create_renderer() -> Renderer {
         let settings = Arc::new(Settings::new());
         settings.register::<WindowSettings>();
+        settings.register::<RendererSettings>();
         Renderer::new(2.0, Config::default(), settings)
+    }
+
+    fn startup_message(content: &str) -> StartupMessage {
+        StartupMessage { kind: MessageKind::Error, content: content.to_string() }
     }
 
     #[test]
@@ -767,5 +902,210 @@ mod tests {
 
         assert_eq!(renderer.user_scale_factor, 1.5);
         assert_eq!(renderer.grid_renderer.shaper.current_size(), initial_size * 1.5);
+    }
+
+    #[test]
+    fn startup_messages_are_kept_until_ui_ready() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![DrawCommand::StartupMessage {
+            message: startup_message("boom"),
+            replace_last: false,
+            append: false,
+        }]);
+
+        assert!(!result.should_show);
+        assert_eq!(result.startup_message_flush, None);
+        assert!(result.startup_messages.is_empty());
+
+        let result = renderer.handle_draw_commands(vec![DrawCommand::UIReady]);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(result.startup_messages, vec![startup_message("boom")]);
+    }
+
+    #[test]
+    fn startup_messages_after_ui_ready_in_same_batch_are_included() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![
+            DrawCommand::UIReady,
+            DrawCommand::StartupMessage {
+                message: startup_message("boom"),
+                replace_last: false,
+                append: false,
+            },
+        ]);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(result.startup_messages, vec![startup_message("boom")]);
+    }
+
+    #[test]
+    fn startup_prompt_flushes_startup_messages() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![
+            DrawCommand::StartupMessage {
+                message: startup_message("boom"),
+                replace_last: false,
+                append: false,
+            },
+            DrawCommand::StartupPrompt,
+        ]);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(result.startup_messages, vec![startup_message("boom")]);
+    }
+
+    #[test]
+    fn startup_message_clear_drops_only_latest_message() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![
+            DrawCommand::StartupMessage {
+                message: startup_message("boom"),
+                replace_last: false,
+                append: false,
+            },
+            DrawCommand::StartupMessage {
+                message: startup_message("progress"),
+                replace_last: false,
+                append: false,
+            },
+            DrawCommand::ClearStartupMessages,
+            DrawCommand::UIReady,
+        ]);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(result.startup_messages, vec![startup_message("boom")]);
+    }
+
+    #[test]
+    fn startup_messages_can_replay_after_message_ui_restore() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![
+            DrawCommand::StartupMessage {
+                message: startup_message("boom"),
+                replace_last: false,
+                append: false,
+            },
+            DrawCommand::ReplayStartupMessages,
+        ]);
+
+        assert!(!result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::Replay));
+        assert_eq!(result.startup_messages, vec![startup_message("boom")]);
+    }
+
+    #[test]
+    fn startup_messages_auto_replay_after_message_ui_restore() {
+        let mut renderer = create_renderer();
+
+        renderer.handle_draw_commands(vec![DrawCommand::ReplayStartupMessages]);
+        let result = renderer.handle_draw_commands(vec![DrawCommand::StartupMessage {
+            message: startup_message("boom"),
+            replace_last: false,
+            append: false,
+        }]);
+
+        assert!(!result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::Replay));
+        assert_eq!(result.startup_messages, vec![startup_message("boom")]);
+    }
+
+    #[test]
+    fn startup_message_replay_state_is_reset_on_clear() {
+        let mut renderer = create_renderer();
+
+        renderer.handle_draw_commands(vec![DrawCommand::ReplayStartupMessages]);
+        renderer.clear();
+        let result = renderer.handle_draw_commands(vec![DrawCommand::StartupMessage {
+            message: startup_message("boom"),
+            replace_last: false,
+            append: false,
+        }]);
+
+        assert!(!result.should_show);
+        assert_eq!(result.startup_message_flush, None);
+        assert!(result.startup_messages.is_empty());
+    }
+
+    #[test]
+    fn startup_messages_can_replace_last_message() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![
+            DrawCommand::StartupMessage {
+                message: startup_message("old"),
+                replace_last: false,
+                append: false,
+            },
+            DrawCommand::StartupMessage {
+                message: startup_message("new"),
+                replace_last: true,
+                append: false,
+            },
+            DrawCommand::UIReady,
+        ]);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(result.startup_messages, vec![startup_message("new")]);
+    }
+
+    #[test]
+    fn startup_messages_can_append_to_previous_message() {
+        let mut renderer = create_renderer();
+
+        let result = renderer.handle_draw_commands(vec![
+            DrawCommand::StartupMessage {
+                message: startup_message("hello"),
+                replace_last: false,
+                append: false,
+            },
+            DrawCommand::StartupMessage {
+                message: startup_message(" world"),
+                replace_last: false,
+                append: true,
+            },
+            DrawCommand::UIReady,
+        ]);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(result.startup_messages, vec![startup_message("hello world")]);
+    }
+
+    #[test]
+    fn startup_messages_keep_only_recent_entries() {
+        let mut renderer = create_renderer();
+        let mut commands = (0..(STARTUP_MESSAGE_LIMIT + 2))
+            .map(|i| DrawCommand::StartupMessage {
+                message: startup_message(&format!("message {i}")),
+                replace_last: false,
+                append: false,
+            })
+            .collect_vec();
+        commands.push(DrawCommand::UIReady);
+
+        let result = renderer.handle_draw_commands(commands);
+
+        assert!(result.should_show);
+        assert_eq!(result.startup_message_flush, Some(StartupMessageFlush::RestoreMessageUi));
+        assert_eq!(
+            result.startup_messages,
+            vec![
+                startup_message("message 2"),
+                startup_message("message 3"),
+                startup_message("message 4"),
+                startup_message("message 5")
+            ]
+        );
     }
 }

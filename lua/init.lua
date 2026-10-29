@@ -93,6 +93,16 @@ vim.api.nvim_create_user_command("NeovideFocus", function()
     rpcnotify("neovide.focus_window")
 end, {})
 
+local function open_neovide_help()
+    local _, err = vim.ui.open("https://neovide.dev/")
+    if err then
+        vim.notify(err, vim.log.levels.ERROR, { title = "Neovide" })
+    end
+end
+
+vim.api.nvim_create_user_command("NeovideHelp", open_neovide_help, {
+    desc = "Open Neovide documentation",
+})
 
 if vim.fn.has("mac") == 1 then
     local URL_PATTERN = "https?://[%w-_%.]+%.%w[%w-_%.%%%?%.:/+=&%%[%]#]*"
@@ -285,10 +295,20 @@ end
 -- Create auto command for retrieving exit code from neovim on quit.
 vim.api.nvim_create_autocmd({ "VimLeavePre" }, {
     pattern = "*",
-    once = true,
     nested = true,
     callback = function()
+        -- plugins like minimap.vim replays exit events before :quit from a
+        -- non-nested WinEnter autocmd, where the real exit events are
+        -- suppressed. https://github.com/wfxr/minimap.vim/pull/36
+        --
+        -- v:exiting is still unset so we keep this callback for any later real exit.
+        if vim.v.exiting == vim.NIL then
+            return
+        end
+
         rpcrequest("neovide.quit", vim.v.exiting)
+
+        return true
     end,
 })
 
@@ -430,18 +450,69 @@ vim.api.nvim_create_autocmd("OptionSet", {
 
 notify_intro_state()
 
-pcall(vim.api.nvim_create_autocmd, 'Progress', {
-    group = vim.api.nvim_create_augroup('NeovideProgressBar', { clear = true }),
-    desc = 'Forward progress events to Neovide',
+local scrollbar_windows = {}
+local scrollbar_group = vim.api.nvim_create_augroup("NeovideScrollbar", { clear = true })
+
+local function notify_scrollbar_window(window)
+    if not vim.api.nvim_win_is_valid(window) then
+        return
+    end
+    local buffer = vim.api.nvim_win_get_buf(window)
+    if scrollbar_windows[window] == buffer then
+        return
+    end
+    scrollbar_windows[window] = buffer
+    pcall(rpcnotify, "neovide.scrollbar_window", window, buffer, true)
+end
+
+local function notify_scrollbar_windows(buffer)
+    -- Include other tabs and every window showing a changed buffer, not just curwin.
+    for _, window in ipairs(vim.api.nvim_list_wins()) do
+        if not buffer or vim.api.nvim_win_get_buf(window) == buffer then
+            notify_scrollbar_window(window)
+        end
+    end
+end
+
+vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter" }, {
+    group = scrollbar_group,
     callback = function(ev)
-        if ev.data and ev.data.status == 'running' then
+        notify_scrollbar_windows(ev.buf)
+    end,
+})
+
+vim.api.nvim_create_autocmd({ "VimEnter", "WinNew", "WinEnter", "TabEnter" }, {
+    group = scrollbar_group,
+    callback = function()
+        notify_scrollbar_windows()
+    end,
+})
+
+vim.api.nvim_create_autocmd("WinClosed", {
+    group = scrollbar_group,
+    callback = function(ev)
+        local window = tonumber(ev.match)
+        scrollbar_windows[window] = nil
+        -- A window-only notification removes metadata, including pre-layout entries.
+        pcall(rpcnotify, "neovide.scrollbar_window", window)
+    end,
+})
+
+notify_scrollbar_windows()
+
+pcall(vim.api.nvim_create_autocmd, "Progress", {
+    group = vim.api.nvim_create_augroup("NeovideProgressBar", { clear = true }),
+    desc = "Forward progress events to Neovide",
+    callback = function(ev)
+        if ev.data then
             progress_bar({
-                percent = ev.data.percent or 0,
+                id = ev.data.id,
+                source = ev.data.source,
+                status = ev.data.status,
+                percent = ev.data.percent,
                 title = ev.data.title or "",
                 message = ev.data.message or "",
             })
-        else
-            progress_bar({ percent = 100 })
         end
     end,
 })

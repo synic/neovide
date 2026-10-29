@@ -3,12 +3,12 @@ use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
+
 use tokio::process::Command as TokioCommand;
 
-use crate::{
-    cmd_line::CmdLineSettings,
-    utils::{expand_tilde, handle_wslpaths},
-};
+use crate::cmd_line::CmdLineSettings;
+use crate::utils::expand_tilde;
+use crate::utils::handle_wslpaths;
 
 #[cfg(target_os = "macos")]
 const FORKED_FROM_TTY_ENV_VAR: &str = "NEOVIDE_FORKED_FROM_TTY";
@@ -65,7 +65,7 @@ impl CommandSpec {
 }
 
 pub fn create_blocking_nvim_command(cmdline_settings: &CmdLineSettings, embed: bool) -> StdCommand {
-    let (bin, args) = build_nvim_command_parts(cmdline_settings, embed, OpenMode::Startup);
+    let (bin, args) = build_nvim_command_parts(cmdline_settings, embed, None, OpenMode::Startup);
     let cwd = command_cwd(cmdline_settings, None);
     let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref());
     let mut cmd = std_command_from_spec(spec);
@@ -81,7 +81,24 @@ pub fn create_tokio_nvim_command(
     cwd: Option<&Path>,
     mode: OpenMode,
 ) -> TokioCommand {
-    let (bin, args) = build_nvim_command_parts(cmdline_settings, embed, mode);
+    let (bin, args) = build_nvim_command_parts(cmdline_settings, embed, None, mode);
+    let cwd = command_cwd(cmdline_settings, cwd);
+    let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref());
+    let mut cmd = tokio_command_from_spec(spec);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
+#[cfg(target_os = "windows")]
+pub fn create_listening_nvim_command(
+    cmdline_settings: &CmdLineSettings,
+    address: &str,
+    cwd: Option<&Path>,
+    mode: OpenMode,
+) -> TokioCommand {
+    let (bin, args) = build_nvim_command_parts(cmdline_settings, false, Some(address), mode);
     let cwd = command_cwd(cmdline_settings, cwd);
     let spec = create_command_spec(&bin, &args, cmdline_settings, cwd.as_deref());
     let mut cmd = tokio_command_from_spec(spec);
@@ -102,6 +119,7 @@ fn command_cwd(settings: &CmdLineSettings, cwd: Option<&Path>) -> Option<PathBuf
 fn build_nvim_command_parts(
     cmdline_settings: &CmdLineSettings,
     embed: bool,
+    listener: Option<&str>,
     mode: OpenMode,
 ) -> (String, Vec<String>) {
     // For OpenMode::Args (handoff/new-window routes), use the route's own
@@ -124,6 +142,11 @@ fn build_nvim_command_parts(
     if embed {
         append_embed_arg(&mut args);
     }
+
+    if let Some(address) = listener {
+        args.extend(["--headless".to_owned(), "--listen".to_owned(), address.to_owned()]);
+    }
+
     args.extend(build_open_args(cmdline_settings, mode));
 
     (bin, args)
@@ -287,11 +310,12 @@ fn create_command_spec(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-
-    use crate::{cmd_line::handle_command_line_arguments, settings::Settings};
+    use std::path::Path;
+    use std::path::PathBuf;
 
     use super::*;
+    use crate::cmd_line::handle_command_line_arguments;
+    use crate::settings::Settings;
 
     fn parse_cmdline_settings(args: &[&str]) -> CmdLineSettings {
         let settings = Settings::new();
@@ -305,7 +329,7 @@ mod tests {
         let cmdline_settings =
             parse_cmdline_settings(&["neovide", "./foo.txt", "./bar.md", "--grid=420x240"]);
 
-        let (_, args) = build_nvim_command_parts(&cmdline_settings, true, OpenMode::Startup);
+        let (_, args) = build_nvim_command_parts(&cmdline_settings, true, None, OpenMode::Startup);
 
         assert_eq!(args, vec!["--embed", "-p", "./foo.txt", "./bar.md"]);
     }
@@ -315,7 +339,7 @@ mod tests {
         let cmdline_settings =
             parse_cmdline_settings(&["neovide", "./foo.txt", "./bar.md", "--grid=420x240"]);
 
-        let (_, args) = build_nvim_command_parts(&cmdline_settings, true, OpenMode::None);
+        let (_, args) = build_nvim_command_parts(&cmdline_settings, true, None, OpenMode::None);
 
         assert_eq!(args, vec!["--embed"]);
     }
@@ -332,7 +356,7 @@ mod tests {
         };
 
         let (bin, args) =
-            build_nvim_command_parts(&cmdline_settings, true, OpenMode::Args(open_args));
+            build_nvim_command_parts(&cmdline_settings, true, None, OpenMode::Args(open_args));
 
         // Route args mode does NOT inherit global cmdline settings
         assert_eq!(bin, "nvim");
@@ -350,7 +374,7 @@ mod tests {
         };
 
         let (bin, args) =
-            build_nvim_command_parts(&cmdline_settings, true, OpenMode::Args(open_args));
+            build_nvim_command_parts(&cmdline_settings, true, None, OpenMode::Args(open_args));
 
         // Uses the route's override, not the global --neovim-bin=nvim-0.9
         assert_eq!(bin, "nvim-0.10");
@@ -365,7 +389,7 @@ mod tests {
             OpenArgs { files_to_open: vec![], tabs: false, neovim_bin: None, neovim_args: None };
 
         let (bin, args) =
-            build_nvim_command_parts(&cmdline_settings, true, OpenMode::Args(open_args));
+            build_nvim_command_parts(&cmdline_settings, true, None, OpenMode::Args(open_args));
 
         // None means default nvim, NOT the global nvim-0.9
         assert_eq!(bin, "nvim");
@@ -384,7 +408,8 @@ mod tests {
             "nvim",
         ]);
 
-        let (bin, args) = build_nvim_command_parts(&cmdline_settings, true, OpenMode::Startup);
+        let (bin, args) =
+            build_nvim_command_parts(&cmdline_settings, true, None, OpenMode::Startup);
 
         assert_eq!(bin, "ssh");
         assert_eq!(args, vec!["my-server", "nvim", "--embed"]);

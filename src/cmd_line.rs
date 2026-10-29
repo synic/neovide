@@ -1,18 +1,25 @@
-use std::{iter, process::ExitStatus};
+use std::iter;
+use std::process::ExitStatus;
 
-use crate::{
-    bridge::create_blocking_nvim_command, dimensions::Dimensions, frame::Frame, settings::*,
-    version::BUILD_VERSION,
-};
-
-use anyhow::{Context, Result};
-use clap::{
-    ArgAction, Parser, ValueEnum,
-    builder::{FalseyValueParser, Styles, styling},
-};
+use anyhow::Context;
+use anyhow::Result;
+use clap::ArgAction;
 #[cfg(target_os = "macos")]
-use clap::{CommandFactory, parser::ValueSource};
+use clap::CommandFactory;
+use clap::Parser;
+use clap::ValueEnum;
+use clap::builder::FalseyValueParser;
+use clap::builder::Styles;
+use clap::builder::styling;
+#[cfg(target_os = "macos")]
+use clap::parser::ValueSource;
 use winit::window::CursorIcon;
+
+use crate::bridge::create_blocking_nvim_command;
+use crate::dimensions::Dimensions;
+use crate::frame::Frame;
+use crate::settings::*;
+use crate::version::BUILD_VERSION;
 
 #[cfg(target_os = "windows")]
 pub const SRGB_DEFAULT: &str = "1";
@@ -172,7 +179,7 @@ pub struct CmdLineSettings {
     )]
     pub system_fullscreen_hotkey: String,
 
-    /// Set the Window > Editors shortcut when native tabs are visible
+    /// Set the Window > Editors shortcut
     #[cfg(target_os = "macos")]
     #[arg(
         long = "system-show-all-tabs-hotkey",
@@ -217,12 +224,25 @@ pub struct CmdLineSettings {
     #[arg(long = "no-vsync", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
     _no_vsync: bool,
 
+    /// Temporarily capture startup messages before the first grid render [DEFAULT]
+    #[arg(long = "startup-message-capture", env = "NEOVIDE_STARTUP_MESSAGE_CAPTURE", action = ArgAction::SetTrue, default_value = "1", value_parser = FalseyValueParser::new())]
+    pub startup_message_capture: bool,
+
+    /// Do not temporarily capture startup messages before the first grid render
+    #[arg(long = "no-startup-message-capture", action = ArgAction::SetTrue, value_parser = FalseyValueParser::new())]
+    _no_startup_message_capture: bool,
+
     /// Which NeoVim binary to invoke headlessly instead of `nvim` found on $PATH
     #[arg(long = "neovim-bin", env = "NEOVIM_BIN")]
     pub neovim_bin: Option<String>,
 
     /// The app ID to show to the compositor (Wayland only, useful for setting WM rules)
-    #[arg(long = "wayland_app_id", env = "NEOVIDE_APP_ID", default_value = "neovide")]
+    #[arg(
+        long = "wayland-app-id",
+        alias = "wayland_app_id",
+        env = "NEOVIDE_APP_ID",
+        default_value = "neovide"
+    )]
     pub wayland_app_id: String,
 
     /// The class part of the X11 WM_CLASS property (X only, useful for setting WM rules)
@@ -314,9 +334,7 @@ impl GeometryArgs {
 }
 
 impl Default for CmdLineSettings {
-    fn default() -> Self {
-        Self::parse_from(iter::empty::<String>())
-    }
+    fn default() -> Self { Self::parse_from(iter::empty::<String>()) }
 }
 
 pub fn handle_command_line_arguments(args: Vec<String>, settings: &Settings) -> Result<()> {
@@ -341,6 +359,10 @@ pub fn handle_command_line_arguments(args: Vec<String>, settings: &Settings) -> 
 
     if cmdline._no_vsync {
         cmdline.vsync = false;
+    }
+
+    if cmdline._no_startup_message_capture {
+        cmdline.startup_message_capture = false;
     }
 
     settings.set::<CmdLineSettings>(&cmdline);

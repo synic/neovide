@@ -1,33 +1,42 @@
-use std::{collections::HashSet, num::NonZeroUsize, rc::Rc};
+use std::collections::HashSet;
+use std::num::NonZeroUsize;
+use std::rc::Rc;
 
 use itertools::Itertools;
-use log::{debug, error, info, trace, warn};
+use log::debug;
+use log::error;
+use log::info;
+use log::trace;
+use log::warn;
 use lru::LruCache;
-use skia_safe::{
-    TextBlob, TextBlobBuilder,
-    graphics::{font_cache_limit, font_cache_used, set_font_cache_limit},
-};
-use swash::{
-    Metrics,
-    shape::ShapeContext,
-    text::{
-        Script,
-        cluster::{CharCluster, Parser, Status, Token},
-    },
-};
+use skia_safe::TextBlob;
+use skia_safe::TextBlobBuilder;
+use skia_safe::graphics::font_cache_limit;
+use skia_safe::graphics::font_cache_used;
+use skia_safe::graphics::set_font_cache_limit;
+use swash::Metrics;
+use swash::shape::ShapeContext;
+use swash::text::Script;
+use swash::text::cluster::CharCluster;
+use swash::text::cluster::Parser;
+use swash::text::cluster::Status;
+use swash::text::cluster::Token;
 
-use crate::{
-    editor::Word,
-    error_msg,
-    profiling::tracy_zone,
-    renderer::fonts::{font_loader::*, font_options::*},
-    units::PixelSize,
-};
+use crate::editor::Word;
+use crate::error_msg;
+use crate::profiling::tracy_zone;
+use crate::renderer::fonts::font_loader::*;
+use crate::renderer::fonts::font_options::*;
+use crate::units::PixelSize;
 
-#[derive(new, Clone, Hash, PartialEq, Eq, Debug)]
+#[derive(Clone, Hash, PartialEq, Eq, Debug)]
 struct ShapeKey {
     pub text: String,
     pub style: CoarseStyle,
+}
+
+impl ShapeKey {
+    pub fn new(text: String, style: CoarseStyle) -> Self { Self { text, style } }
 }
 
 const FONT_CACHE_SIZE: usize = 8 * 1024 * 1024;
@@ -198,9 +207,7 @@ impl CachingShaper {
         self.blob_cache.clear();
     }
 
-    pub fn font_names(&self) -> Vec<String> {
-        self.font_loader.font_names()
-    }
+    pub fn font_names(&self) -> Vec<String> { self.font_loader.font_names() }
 
     fn info(&mut self) -> (Metrics, f32) {
         if let Some(info) = self.font_info {
@@ -250,9 +257,7 @@ impl CachingShaper {
         }
     }
 
-    pub fn stroke_size(&mut self) -> f32 {
-        self.metrics().stroke_size
-    }
+    pub fn stroke_size(&mut self) -> f32 { self.metrics().stroke_size }
 
     pub fn baseline_offset(&mut self) -> f32 {
         let metrics = self.metrics();
